@@ -26,7 +26,7 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Score all active wallets
+      - name: Harvest + score wallets
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
@@ -35,6 +35,9 @@ jobs:
             echo "Required secrets not set; skipping."
             exit 0
           fi
+          echo ">>> Harvest new candidates from recent pools"
+          python -m dexbot.discovery harvest --max-pools 50 --days 14
+          echo ">>> Score all active wallets"
           python -m dexbot.discovery score --all --days "${{ inputs.days || 30 }}"
-          echo "---"
+          echo ">>> Top 30 ranked"
           python -m dexbot.discovery list --limit 30

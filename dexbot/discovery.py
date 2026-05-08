@@ -5,6 +5,7 @@ CLI:
     python -m dexbot.discovery list [--limit 20]
     python -m dexbot.discovery score [--wallet ADDR | --all] [--days 30]
     python -m dexbot.discovery remove ADDR
+    python -m dexbot.discovery harvest [--max-pools 30] [--days 14]
 
 Scoring is intentionally simple for v1: it ranks wallets by a composite of
 30-day trade count, distinct tokens traded, recency, and SOL-flow PnL
@@ -20,7 +21,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from . import db, helius
+from . import db, harvest, helius
 from .config import Config, load_config
 from .parser import SOL_MINT, SwapEvent, parse_swaps
 
@@ -278,6 +279,17 @@ def main(argv: list[str] | None = None) -> int:
     p_sc_grp.add_argument("--all", action="store_true", help="Score all active wallets.")
     p_sc.add_argument("--days", type=int, default=DEFAULT_WINDOW_DAYS)
 
+    p_h = sub.add_parser(
+        "harvest",
+        help="Find new candidate wallets from on-chain pool activity.",
+    )
+    p_h.add_argument("--max-pools", type=int, default=30)
+    p_h.add_argument("--days", type=int, default=14,
+                     help="Only use candidates detected in the last N days.")
+    p_h.add_argument("--min-distinct-tokens", type=int, default=2)
+    p_h.add_argument("--min-trades", type=int, default=5)
+    p_h.add_argument("--max-trades", type=int, default=200)
+
     args = p.parse_args(argv)
     config = load_config()
     logging.basicConfig(
@@ -323,6 +335,28 @@ def main(argv: list[str] | None = None) -> int:
                           f"pnl_sol={stats.realized_pnl_sol:+7.2f}")
                 except helius.HeliusError as e:
                     log.warning("skipping %s: %s", addr, e)
+            return 0
+
+        if args.cmd == "harvest":
+            results = harvest.harvest_from_pools(
+                conn,
+                days=args.days,
+                max_pools=args.max_pools,
+                min_distinct_tokens=args.min_distinct_tokens,
+                min_trades=args.min_trades,
+                max_trades=args.max_trades,
+            )
+            added = 0
+            for wallet, trades, tokens in results:
+                add_wallet(
+                    conn, wallet, source="harvest_pool",
+                    notes=f"{tokens} mints / {trades} trades observed at harvest",
+                )
+                added += 1
+            conn.commit()
+            print(f"harvested {len(results)} candidate(s); upserted into watchlist: {added}")
+            for w, t, n in results[:30]:
+                print(f"  {w}  tokens={n:>2d}  trades={t:>3d}")
             return 0
 
     return 0

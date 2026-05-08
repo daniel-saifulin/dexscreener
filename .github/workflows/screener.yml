@@ -1,0 +1,57 @@
+name: screener
+
+on:
+  schedule:
+    # GitHub Actions cron is best-effort and can be delayed by 5-30 min
+    # under load. That's acceptable for the paper-trading research phase.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'dexbot/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - '.github/workflows/screener.yml'
+
+concurrency:
+  group: screener
+  cancel-in-progress: false
+
+jobs:
+  test:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  run:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+
+      # If DATABASE_URL is unset (e.g. before user wires up Neon),
+      # run in dry-run mode so the workflow still demonstrates value.
+      - name: Run screener
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL not set — running --dry-run"
+            python -m dexbot.screener --dry-run
+          else
+            python -m dexbot.screener
+          fi

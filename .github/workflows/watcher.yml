@@ -1,0 +1,32 @@
+name: watcher
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # poll every 10 min; Actions cron may slip
+  workflow_dispatch:
+
+concurrency:
+  group: watcher
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Watcher poll + monitor
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+        run: |
+          if [ -z "$DATABASE_URL" ] || [ -z "$HELIUS_API_KEY" ]; then
+            echo "Required secrets not set; skipping."
+            exit 0
+          fi
+          python -m dexbot.watcher

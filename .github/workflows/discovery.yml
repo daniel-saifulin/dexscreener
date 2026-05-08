@@ -1,0 +1,40 @@
+name: discovery
+
+on:
+  schedule:
+    # Sunday 03:00 UTC. Re-scores all active wallets weekly.
+    - cron: '0 3 * * 0'
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Lookback window in days'
+        default: '30'
+        required: false
+
+concurrency:
+  group: discovery
+  cancel-in-progress: false
+
+jobs:
+  rescore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Score all active wallets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+        run: |
+          if [ -z "$DATABASE_URL" ] || [ -z "$HELIUS_API_KEY" ]; then
+            echo "Required secrets not set; skipping."
+            exit 0
+          fi
+          python -m dexbot.discovery score --all --days "${{ inputs.days || 30 }}"
+          echo "---"
+          python -m dexbot.discovery list --limit 30

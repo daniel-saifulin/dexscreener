@@ -64,6 +64,35 @@ def fetch_pairs_for_token(token_address: str) -> list[dict]:
     return []
 
 
+BATCH_SIZE = 30  # DexScreener accepts up to 30 comma-separated addresses
+
+
+def fetch_pairs_for_tokens(token_addresses: list[str]) -> dict[str, list[dict]]:
+    """Batch variant: returns {token_address: [pair, ...]} for many tokens
+    in one go (one HTTP per BATCH_SIZE tokens). Tokens with no listings
+    are absent from the result.
+    """
+    out: dict[str, list[dict]] = {}
+    if not token_addresses:
+        return out
+    seen = list(dict.fromkeys(token_addresses))
+    for i in range(0, len(seen), BATCH_SIZE):
+        batch = seen[i:i + BATCH_SIZE]
+        joined = ",".join(batch)
+        try:
+            data = _get(f"/latest/dex/tokens/{joined}")
+        except DexScreenerError as e:
+            log.warning("batch fetch (%d tokens) failed: %s", len(batch), e)
+            continue
+        if not isinstance(data, dict):
+            continue
+        for pair in data.get("pairs") or []:
+            addr = ((pair.get("baseToken") or {}).get("address") or "").strip()
+            if addr:
+                out.setdefault(addr, []).append(pair)
+    return out
+
+
 def best_pair(pairs: list[dict]) -> dict | None:
     """Pick highest-liquidity pair (most reliable price discovery)."""
     valid = [p for p in pairs if (p.get("liquidity") or {}).get("usd")]

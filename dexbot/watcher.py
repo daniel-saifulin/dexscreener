@@ -226,7 +226,12 @@ def run_once(database_url: str) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 def monitor_open_trades(database_url: str) -> int:
-    """Returns count of trades closed this pass."""
+    """Returns count of trades closed this pass.
+
+    Performance: prices are fetched in batches of 30 via the DexScreener
+    multi-token endpoint instead of one HTTP per trade. With ~500 open
+    trades this drops monitoring from ~10 min to ~10 sec.
+    """
     closed = 0
     with db.connect(database_url) as conn:
         with conn.cursor() as cur:
@@ -241,14 +246,32 @@ def monitor_open_trades(database_url: str) -> int:
             )
             trades = cur.fetchall()
         log.info("monitoring %d open paper trades", len(trades))
+        if not trades:
+            return 0
+
+        # Group by chain to feed batch endpoint
+        by_chain: dict[str, list] = {}
+        for t in trades:
+            by_chain.setdefault(t[1], []).append(t)
+
+        pair_by_token: dict[str, dict] = {}
+        for chain, chain_trades in by_chain.items():
+            addrs = list({t[2] for t in chain_trades})
+            log.info("  batch-fetching %d %s prices", len(addrs), chain)
+            pairs_map = dexscreener.fetch_pairs_for_tokens(addrs)
+            for addr, pair_list in pairs_map.items():
+                in_chain = [
+                    p for p in pair_list
+                    if (p.get("chainId") or "").lower() == chain
+                ]
+                best = dexscreener.best_pair(in_chain)
+                if best:
+                    pair_by_token[addr] = best
 
         now = time.time()
         for trade_id, chain, addr, symbol, entry, stop, take, opened in trades:
             try:
-                pairs = dexscreener.fetch_pairs_for_token(addr)
-                pair = dexscreener.best_pair([
-                    p for p in pairs if (p.get("chainId") or "").lower() == chain
-                ])
+                pair = pair_by_token.get(addr)
                 if not pair or not pair.get("priceUsd"):
                     continue
                 try:

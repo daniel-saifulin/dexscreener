@@ -6,6 +6,9 @@ CLI:
     python -m dexbot.discovery score [--wallet ADDR | --all] [--days 30]
     python -m dexbot.discovery remove ADDR
     python -m dexbot.discovery harvest [--max-pools 30] [--days 14]
+    python -m dexbot.discovery promote ADDR    # включить в core-набор
+    python -m dexbot.discovery demote ADDR     # исключить из core-набора
+    python -m dexbot.discovery list-core       # показать текущее ядро
 
 Scoring is intentionally simple for v1: it ranks wallets by a composite of
 30-day trade count, distinct tokens traded, recency, and SOL-flow PnL
@@ -290,6 +293,14 @@ def main(argv: list[str] | None = None) -> int:
     p_h.add_argument("--min-trades", type=int, default=5)
     p_h.add_argument("--max-trades", type=int, default=200)
 
+    p_pr = sub.add_parser("promote", help="Add wallet to core set (will trigger paper trades).")
+    p_pr.add_argument("address")
+
+    p_dm = sub.add_parser("demote", help="Remove wallet from core set (signals still logged).")
+    p_dm.add_argument("address")
+
+    sub.add_parser("list-core", help="Show wallets currently in core set.")
+
     args = p.parse_args(argv)
     config = load_config()
     logging.basicConfig(
@@ -357,6 +368,52 @@ def main(argv: list[str] | None = None) -> int:
             print(f"harvested {len(results)} candidate(s); upserted into watchlist: {added}")
             for w, t, n in results[:30]:
                 print(f"  {w}  tokens={n:>2d}  trades={t:>3d}")
+            return 0
+
+        if args.cmd == "promote":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE watched_wallets SET is_core=TRUE, core_set_at=NOW() "
+                    "WHERE address=%s",
+                    (args.address,),
+                )
+                ok = cur.rowcount
+            conn.commit()
+            print(f"promoted to core: {args.address}" if ok else f"wallet not found: {args.address}")
+            return 0
+
+        if args.cmd == "demote":
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE watched_wallets SET is_core=FALSE WHERE address=%s",
+                    (args.address,),
+                )
+                ok = cur.rowcount
+            conn.commit()
+            print(f"demoted from core: {args.address}" if ok else f"wallet not found: {args.address}")
+            return 0
+
+        if args.cmd == "list-core":
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT address, score, trades_30d, distinct_tokens_30d,
+                           last_active_at, core_set_at
+                    FROM watched_wallets
+                    WHERE is_core=TRUE AND is_active=TRUE
+                    ORDER BY score DESC NULLS LAST
+                    """
+                )
+                rows = cur.fetchall()
+            if not rows:
+                print("(core set is empty)")
+                return 0
+            print(f"{'address':<48s} {'score':>7s} {'trades30d':>10s} "
+                  f"{'tokens30d':>10s} {'core_since':<20s}")
+            for addr, score, trades, tokens, last, core_at in rows:
+                core_at_s = core_at.strftime("%Y-%m-%d %H:%M") if core_at else "-"
+                print(f"{addr:<48s} {float(score or 0):>7.1f} "
+                      f"{trades or 0:>10d} {tokens or 0:>10d} {core_at_s:<20s}")
             return 0
 
     return 0

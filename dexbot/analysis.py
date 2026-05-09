@@ -190,17 +190,95 @@ def fetch_wallet_cohorts(conn):
         cur.execute("""
             SELECT t.triggered_by_wallet AS wallet,
                    w.score,
+                   w.is_core,
                    ROUND(EXTRACT(EPOCH FROM (NOW() - w.added_at))/3600, 1) AS age_hours,
                    COUNT(t.id) AS trades,
                    SUM(CASE WHEN t.status='closed_tp' THEN 1 ELSE 0 END) AS wins,
                    SUM(CASE WHEN t.status='closed_sl' THEN 1 ELSE 0 END) AS losses,
                    SUM(CASE WHEN t.status LIKE 'closed%%' THEN 1 ELSE 0 END) AS closed,
-                   ROUND(AVG(t.pnl_pct)::numeric, 1) AS avg_pnl
+                   ROUND(AVG(t.pnl_pct)::numeric, 1) AS avg_pnl,
+                   ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY t.pnl_pct)
+                         FILTER (WHERE t.status LIKE 'closed%%')::numeric, 1) AS median_pnl
             FROM wallet_paper_trades t
             JOIN watched_wallets w ON w.address = t.triggered_by_wallet
-            GROUP BY t.triggered_by_wallet, w.score, w.added_at
+            GROUP BY t.triggered_by_wallet, w.score, w.is_core, w.added_at
             ORDER BY trades DESC
             LIMIT 20
+        """)
+        return cur.fetchall()
+
+
+def fetch_core_strategy_outcomes(conn):
+    """Performance of core-conviction trades only (Уровень 2)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                status, COUNT(*),
+                ROUND(AVG(pnl_pct)::numeric, 1),
+                ROUND(MIN(pnl_pct)::numeric, 1),
+                ROUND(MAX(pnl_pct)::numeric, 1),
+                ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct)::numeric, 1)
+            FROM wallet_paper_trades
+            WHERE from_core_conviction = TRUE
+            GROUP BY status ORDER BY COUNT(*) DESC
+        """)
+        return cur.fetchall()
+
+
+def fetch_promotion_candidates(conn):
+    """Non-core wallets that meet stable-trader criteria — promotion candidates."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH per_wallet AS (
+                SELECT
+                    t.triggered_by_wallet AS wallet,
+                    w.score, w.is_core,
+                    COUNT(*) FILTER (WHERE t.status LIKE 'closed%%') AS closed,
+                    SUM(CASE WHEN t.status='closed_tp' THEN 1 ELSE 0 END) AS wins,
+                    ROUND(AVG(t.pnl_pct)::numeric, 1) AS mean_pnl,
+                    ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY t.pnl_pct)
+                          FILTER (WHERE t.status LIKE 'closed%%')::numeric, 1) AS median_pnl
+                FROM wallet_paper_trades t
+                JOIN watched_wallets w ON w.address = t.triggered_by_wallet
+                WHERE w.is_active = TRUE AND w.is_core = FALSE
+                GROUP BY t.triggered_by_wallet, w.score, w.is_core
+            )
+            SELECT wallet, closed, wins,
+                   ROUND(100.0 * wins::numeric / NULLIF(closed,0), 0) AS wr,
+                   mean_pnl, median_pnl, score
+            FROM per_wallet
+            WHERE closed >= 20
+              AND 100.0 * wins::numeric / NULLIF(closed,0) >= 55
+              AND median_pnl >= 0
+            ORDER BY wr DESC, median_pnl DESC
+            LIMIT 10
+        """)
+        return cur.fetchall()
+
+
+def fetch_core_decline_candidates(conn):
+    """Core wallets whose stats now LOOK BAD — candidates to demote."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH per_wallet AS (
+                SELECT
+                    t.triggered_by_wallet AS wallet,
+                    w.score,
+                    COUNT(*) FILTER (WHERE t.status LIKE 'closed%%') AS closed,
+                    SUM(CASE WHEN t.status='closed_tp' THEN 1 ELSE 0 END) AS wins,
+                    ROUND(AVG(t.pnl_pct)::numeric, 1) AS mean_pnl,
+                    ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY t.pnl_pct)
+                          FILTER (WHERE t.status LIKE 'closed%%')::numeric, 1) AS median_pnl
+                FROM wallet_paper_trades t
+                JOIN watched_wallets w ON w.address = t.triggered_by_wallet
+                WHERE w.is_core = TRUE
+                GROUP BY t.triggered_by_wallet, w.score
+            )
+            SELECT wallet, closed, wins,
+                   ROUND(100.0 * wins::numeric / NULLIF(closed,0), 0) AS wr,
+                   mean_pnl, median_pnl, score
+            FROM per_wallet
+            ORDER BY median_pnl ASC NULLS LAST
         """)
         return cur.fetchall()
 
@@ -227,6 +305,9 @@ def render(database_url: str, md: bool = False) -> str:
         cross_tokens = fetch_cross_wallet_tokens(conn)
         conviction_rows = fetch_conviction_comparison(conn)
         wallet_rows = fetch_wallet_cohorts(conn)
+        core_strategy_rows = fetch_core_strategy_outcomes(conn)
+        promotion_candidates = fetch_promotion_candidates(conn)
+        core_health_rows = fetch_core_decline_candidates(conn)
 
     # Compute headline numbers
     def _agg(rows, status):
@@ -366,16 +447,56 @@ def render(database_url: str, md: bool = False) -> str:
     parts.append(f"\n{H2}Per-wallet trade outcomes{H2_END}")
     if wallet_rows:
         rows = []
-        for w_addr, score, age_h, trades, wins, losses, closed, avg in wallet_rows:
+        for w_addr, score, is_core, age_h, trades, wins, losses, closed, avg, median in wallet_rows:
             decided = wins + losses
             wr = f"{(wins/decided*100):.0f}%" if decided else "n/a"
-            rows.append([w_addr[:12] + "…", float(score or 0), float(age_h),
-                         trades, wins, losses, closed, wr, _fmt_pct(avg)])
-        cols = ["wallet", "score", "age_h", "trades", "wins", "losses",
-                "closed", "win_rate", "avg_pnl"]
+            tag = "★" if is_core else " "
+            rows.append([tag + " " + w_addr[:12] + "…", float(score or 0), float(age_h),
+                         trades, wins, losses, closed, wr,
+                         _fmt_pct(avg), _fmt_pct(median)])
+        cols = ["wallet (★=core)", "score", "age_h", "trades", "wins", "losses",
+                "closed", "win_rate", "avg_pnl", "median"]
         parts.append((_md_table if md else _txt_table)(cols, rows))
     else:
         parts.append("  (no per-wallet data yet)\n")
+
+    # ==== Core strategy (Уровень 2) ====
+    parts.append(f"\n{H2}Core strategy outcomes (cross-wallet conviction trades only){H2_END}")
+    if core_strategy_rows:
+        rows = [[s, n, _fmt_pct(avg), _fmt_pct(w), _fmt_pct(b), _fmt_pct(med)]
+                for s, n, avg, w, b, med in core_strategy_rows]
+        cols = ["status", "n", "avg pnl", "worst", "best", "median"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+    else:
+        parts.append("  (no core-conviction trades opened yet — нужно ≥2 core-кошелька на одном токене)\n")
+
+    # ==== Core health ====
+    parts.append(f"\n{H2}Health of current core wallets{H2_END}")
+    if core_health_rows:
+        rows = []
+        for w_addr, closed, wins, wr, mean_pnl, median_pnl, score in core_health_rows:
+            wr_s = f"{int(wr)}%" if wr is not None else "n/a"
+            rows.append([w_addr[:14] + "…", closed, wins, wr_s,
+                         _fmt_pct(mean_pnl), _fmt_pct(median_pnl), float(score or 0)])
+        cols = ["wallet", "closed", "wins", "win_rate", "mean_pnl", "median", "score"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+    else:
+        parts.append("  (no core wallets defined)\n")
+
+    # ==== Promotion candidates ====
+    parts.append(f"\n{H2}Promotion candidates (non-core wallets matching stable criteria){H2_END}")
+    parts.append("  Критерий: ≥20 закрытых, win rate ≥55%, медиана PnL ≥0%\n")
+    if promotion_candidates:
+        rows = []
+        for w_addr, closed, wins, wr, mean_pnl, median_pnl, score in promotion_candidates:
+            wr_s = f"{int(wr)}%" if wr is not None else "n/a"
+            rows.append([w_addr[:14] + "…", closed, wins, wr_s,
+                         _fmt_pct(mean_pnl), _fmt_pct(median_pnl), float(score or 0)])
+        cols = ["wallet", "closed", "wins", "win_rate", "mean_pnl", "median", "score"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+        parts.append("  Чтобы добавить в core: `python -m dexbot.discovery promote ADDR`\n")
+    else:
+        parts.append("  (пока нет достойных кандидатов — нужно ≥20 закрытых сделок на кошельке)\n")
 
     # ==== Verdict ====
     parts.append(f"\n{H2}Read this as{H2_END}")

@@ -38,6 +38,12 @@ TIMEOUT_HOURS = 24
 MIN_WALLET_SCORE = 30.0
 MAX_TRADES_PER_POLL_PER_WALLET = 10  # cap for sanity on first run / catch-up
 
+# Core conviction strategy: open paper trade only when ≥2 core wallets
+# bought the same token within CORE_CONVICTION_WINDOW_MIN.
+MIN_CORE_BUYERS = 2
+CORE_CONVICTION_WINDOW_MIN = 30
+DEDUP_RECENT_TRADE_HOURS = 24    # don't open another paper trade on the same token within this window
+
 
 # ---------------------------------------------------------------------------
 # Polling
@@ -55,6 +61,48 @@ def fetch_active_wallets(conn) -> list[tuple[str, str | None]]:
             (MIN_WALLET_SCORE,),
         )
         return cur.fetchall()
+
+
+def fetch_core_set(conn) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT address FROM watched_wallets WHERE is_core=TRUE AND is_active=TRUE")
+        return {row[0] for row in cur.fetchall()}
+
+
+def count_core_buyers(conn, token_address: str, core_set: set[str],
+                      window_min: int = CORE_CONVICTION_WINDOW_MIN) -> int:
+    """How many DISTINCT core wallets bought this token in the last window_min?"""
+    if not core_set:
+        return 0
+    placeholders = ",".join(["%s"] * len(core_set))
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT COUNT(DISTINCT wallet)
+            FROM wallet_signals
+            WHERE action='buy' AND chain='solana' AND token_address=%s
+              AND wallet IN ({placeholders})
+              AND block_time >= NOW() - INTERVAL '{window_min} minutes'
+            """,
+            (token_address, *core_set),
+        )
+        return cur.fetchone()[0] or 0
+
+
+def has_recent_open_or_closed_trade(conn, chain: str, token_address: str,
+                                    hours: int = DEDUP_RECENT_TRADE_HOURS) -> bool:
+    """Avoid opening multiple paper trades on the same token within hours."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM wallet_paper_trades
+            WHERE chain=%s AND token_address=%s
+              AND opened_at >= NOW() - (%s || ' hours')::interval
+            LIMIT 1
+            """,
+            (chain, token_address, str(hours)),
+        )
+        return cur.fetchone() is not None
 
 
 def _new_txs_since(wallet: str, last_sig: str | None, *, limit: int = 50) -> list[dict]:
@@ -124,7 +172,8 @@ def _pair_symbol(pair: dict | None) -> str | None:
 
 
 def _open_paper_trade(conn, *, signal_id: int, chain: str, token_address: str,
-                      symbol: str | None, wallet: str, pair: dict) -> int | None:
+                      symbol: str | None, wallet: str, pair: dict,
+                      from_core_conviction: bool = False) -> int | None:
     """Open paper trade with fixed TP/SL given a DexScreener pair dict."""
     if not pair or not pair.get("priceUsd"):
         return None
@@ -141,13 +190,14 @@ def _open_paper_trade(conn, *, signal_id: int, chain: str, token_address: str,
             """
             INSERT INTO wallet_paper_trades (
                 signal_id, chain, token_address, symbol, triggered_by_wallet,
-                entry_price_usd, stop_price_usd, take_price_usd
+                entry_price_usd, stop_price_usd, take_price_usd, from_core_conviction
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (signal_id) DO NOTHING
             RETURNING id
             """,
-            (signal_id, chain, token_address, symbol, wallet, entry, stop, take),
+            (signal_id, chain, token_address, symbol, wallet, entry, stop, take,
+             from_core_conviction),
         )
         row = cur.fetchone()
         return row[0] if row else None
@@ -170,8 +220,15 @@ def run_once(database_url: str) -> tuple[int, int]:
 
     with db.connect(database_url) as conn:
         wallets = fetch_active_wallets(conn)
-        log.info("polling %d wallets (score>=%.0f)", len(wallets), MIN_WALLET_SCORE)
+        core_set = fetch_core_set(conn)
+        log.info("polling %d wallets (score>=%.0f, of which core: %d)",
+                 len(wallets), MIN_WALLET_SCORE, len(core_set))
+        if not core_set:
+            log.warning("no core wallets defined — paper trades won't open. "
+                        "Use `discovery promote ADDR` to set the core set.")
+
         for wallet, last_sig in wallets:
+            wallet_is_core = wallet in core_set
             try:
                 txs = _new_txs_since(wallet, last_sig, limit=50)
                 if not txs:
@@ -188,6 +245,9 @@ def run_once(database_url: str) -> tuple[int, int]:
                     in_cand = ever_passed is not None
                     pair = _fetch_pair("solana", ev.token_mint)
                     symbol = candidate_symbol or _pair_symbol(pair)
+
+                    # Always insert the signal (we want full activity log
+                    # for promotion-candidate analysis later).
                     sig_id = _insert_signal(
                         conn, wallet=wallet, ev=ev,
                         ever_passed=ever_passed, in_candidates=in_cand, symbol=symbol,
@@ -195,24 +255,41 @@ def run_once(database_url: str) -> tuple[int, int]:
                     if sig_id is None:
                         continue
                     new_signals += 1
+
+                    # Paper trade only opens on core conviction.
+                    if not wallet_is_core:
+                        continue
                     if pair is None:
                         log.warning("  no DexScreener pair for %s; signal logged but no paper trade",
                                     ev.token_mint[:8])
                         continue
+
+                    n_buyers = count_core_buyers(conn, ev.token_mint, core_set)
+                    if n_buyers < MIN_CORE_BUYERS:
+                        log.info("  %s buy %s: core_buyers=%d (<%d), not opening trade",
+                                 wallet[:8], symbol or ev.token_mint[:8],
+                                 n_buyers, MIN_CORE_BUYERS)
+                        continue
+                    if has_recent_open_or_closed_trade(conn, "solana", ev.token_mint):
+                        log.info("  %s buy %s: dedup (existing trade in last %dh)",
+                                 wallet[:8], symbol or ev.token_mint[:8], DEDUP_RECENT_TRADE_HOURS)
+                        continue
+
                     trade_id = _open_paper_trade(
                         conn, signal_id=sig_id, chain="solana",
-                        token_address=ev.token_mint, symbol=symbol, wallet=wallet, pair=pair,
+                        token_address=ev.token_mint, symbol=symbol, wallet=wallet,
+                        pair=pair, from_core_conviction=True,
                     )
                     if trade_id:
                         new_trades += 1
                         opened_this_wallet += 1
-                        log.info("  trade opened: wallet=%s buy %s",
-                                 wallet[:8], symbol or ev.token_mint[:8])
+                        log.info("  CORE trade opened: %s buy %s (n_core_buyers=%d)",
+                                 wallet[:8], symbol or ev.token_mint[:8], n_buyers)
 
                 if latest_sig_seen:
                     _update_wallet_cursor(conn, wallet, latest_sig_seen)
                 conn.commit()
-                log.info("  %s: %d new buys, %d trades opened",
+                log.info("  %s: %d new buys, %d core trades opened",
                          wallet[:8], len(buys), opened_this_wallet)
             except Exception as e:
                 conn.rollback()

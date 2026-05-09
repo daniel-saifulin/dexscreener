@@ -1,0 +1,31 @@
+name: analysis
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'   # every 4 hours, on the hour
+  workflow_dispatch:
+
+concurrency:
+  group: analysis
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Render report into Step Summary
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL not set; skipping." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python -m dexbot.analysis --markdown >> "$GITHUB_STEP_SUMMARY"

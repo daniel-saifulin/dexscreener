@@ -226,7 +226,12 @@ def fetch_core_strategy_outcomes(conn):
 
 
 def fetch_promotion_candidates(conn):
-    """Non-core wallets that meet stable-trader criteria — promotion candidates."""
+    """Non-core wallets that meet stable-trader criteria — promotion candidates.
+
+    WR is calculated EXCLUDING timeouts (wins / (wins + losses)). This matches
+    the per-wallet display and is the correct way to evaluate signal quality
+    when many trades close by 24h timeout near 0%.
+    """
     with conn.cursor() as cur:
         cur.execute("""
             WITH per_wallet AS (
@@ -235,6 +240,7 @@ def fetch_promotion_candidates(conn):
                     w.score, w.is_core,
                     COUNT(*) FILTER (WHERE t.status LIKE 'closed%%') AS closed,
                     SUM(CASE WHEN t.status='closed_tp' THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN t.status='closed_sl' THEN 1 ELSE 0 END) AS losses,
                     ROUND(AVG(t.pnl_pct)::numeric, 1) AS mean_pnl,
                     ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY t.pnl_pct)
                           FILTER (WHERE t.status LIKE 'closed%%')::numeric, 1) AS median_pnl
@@ -243,14 +249,14 @@ def fetch_promotion_candidates(conn):
                 WHERE w.is_active = TRUE AND w.is_core = FALSE
                 GROUP BY t.triggered_by_wallet, w.score, w.is_core
             )
-            SELECT wallet, closed, wins,
-                   ROUND(100.0 * wins::numeric / NULLIF(closed,0), 0) AS wr,
+            SELECT wallet, closed, wins, losses,
+                   ROUND(100.0 * wins::numeric / NULLIF(wins+losses, 0), 0) AS wr_decided,
                    mean_pnl, median_pnl, score
             FROM per_wallet
-            WHERE closed >= 20
-              AND 100.0 * wins::numeric / NULLIF(closed,0) >= 55
+            WHERE closed >= 100
+              AND 100.0 * wins::numeric / NULLIF(wins+losses, 0) >= 55
               AND median_pnl >= 0
-            ORDER BY wr DESC, median_pnl DESC
+            ORDER BY wr_decided DESC, median_pnl DESC
             LIMIT 10
         """)
         return cur.fetchall()
@@ -485,18 +491,18 @@ def render(database_url: str, md: bool = False) -> str:
 
     # ==== Promotion candidates ====
     parts.append(f"\n{H2}Promotion candidates (non-core wallets matching stable criteria){H2_END}")
-    parts.append("  Критерий: ≥20 закрытых, win rate ≥55%, медиана PnL ≥0%\n")
+    parts.append("  Критерий: ≥100 закрытых, WR ≥55% (без таймаутов), медиана PnL ≥0%\n")
     if promotion_candidates:
         rows = []
-        for w_addr, closed, wins, wr, mean_pnl, median_pnl, score in promotion_candidates:
+        for w_addr, closed, wins, losses, wr, mean_pnl, median_pnl, score in promotion_candidates:
             wr_s = f"{int(wr)}%" if wr is not None else "n/a"
-            rows.append([w_addr[:14] + "…", closed, wins, wr_s,
+            rows.append([w_addr[:14] + "…", closed, wins, losses, wr_s,
                          _fmt_pct(mean_pnl), _fmt_pct(median_pnl), float(score or 0)])
-        cols = ["wallet", "closed", "wins", "win_rate", "mean_pnl", "median", "score"]
+        cols = ["wallet", "closed", "wins", "losses", "wr_decided", "mean_pnl", "median", "score"]
         parts.append((_md_table if md else _txt_table)(cols, rows))
         parts.append("  Чтобы добавить в core: `python -m dexbot.discovery promote ADDR`\n")
     else:
-        parts.append("  (пока нет достойных кандидатов — нужно ≥20 закрытых сделок на кошельке)\n")
+        parts.append("  (пока нет достойных кандидатов — нужно ≥100 закрытых сделок на кошельке)\n")
 
     # ==== Verdict ====
     parts.append(f"\n{H2}Read this as{H2_END}")

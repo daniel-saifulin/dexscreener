@@ -100,15 +100,35 @@ def cmd_create(url: str, secret: str | None = None) -> None:
 
 def cmd_update(webhook_id: str, url: str | None = None, secret: str | None = None) -> None:
     addrs = _core_addresses()
+
+    # Helius PUT требует webhookURL всегда. Если не передан — берём текущий из самого webhook'а.
+    if not url:
+        r = requests.get(
+            f"{HELIUS_BASE}/v0/webhooks/{webhook_id}",
+            params={"api-key": _key()},
+            timeout=15,
+        )
+        if not r.ok:
+            print(f"ERROR fetching current webhook: {r.status_code} {r.text[:300]}",
+                  file=sys.stderr)
+            sys.exit(1)
+        current = r.json()
+        url = current.get("webhookURL")
+        if not url:
+            print("ERROR: webhook не имеет URL в текущем состоянии и --url не передан",
+                  file=sys.stderr)
+            sys.exit(1)
+        print(f"(URL не передан, использую текущий: {url})")
+
     body: dict = {
+        "webhookURL": url,
         "transactionTypes": ["SWAP"],
         "accountAddresses": addrs,
         "webhookType": "enhanced",
     }
-    if url:
-        body["webhookURL"] = url
     if secret:
         body["authHeader"] = secret
+
     r = requests.put(
         f"{HELIUS_BASE}/v0/webhooks/{webhook_id}",
         params={"api-key": _key()},

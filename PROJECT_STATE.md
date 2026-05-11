@@ -70,7 +70,7 @@ python -m dexbot.discovery promote ADDRESS
 python -m dexbot.discovery demote ADDRESS
 
 # После promote/demote — синхронизировать Helius webhook с новым ядром
-python -m dexbot.setup_helius_webhook update 3cb7c36f-6026-47b9-99dc-68953f1ef314
+python -m dexbot.setup_helius_webhook update c3249c3b-ef1e-4f36-82b4-4e3018814fc0
 
 # Принудительный запуск чего-либо
 gh workflow run watcher.yml --repo daniel-saifulin/dexscreener
@@ -106,5 +106,5 @@ curl https://dexbot-webhook.fly.dev/core
 - **2026-05-10 утром**: реактивировал `BSfQT2Am` (его открытые сделки докрутились до +172% медианы на 39 закрытых) и расширил ядро до **6**, добавив `GvyLS9WF` и `ESuvjvsQ`.
 - **2026-05-10 вечером**: обнаружил **баг в метрике WR** в разделе Promotion candidates — таймауты считались как «не победы», что прятало валидных кандидатов. Починил. По правильной метрике повысил **8L2y55D1** → ядро стало **7 кошельков**. Ужесточил порог: ≥100 закрытых (было ≥20). Урок сохранён в память.
 - **2026-05-11 утром**: тот же баг WR-метрики оказался и в разделе Health of current core wallets — починил, добавил колонку timeout%. Обнаружил что у ESuvjvsQ 68% сделок завершаются таймаутом (медленные сигналы) — оставил на испытательном сроке.
-- **2026-05-11 днём**: **развернул webhook-инфру на fly.io**. Helius webhook id `3cb7c36f-6026-47b9-99dc-68953f1ef314` подписан на 7 ядерных кошельков. Cron-Watcher переключён в режим `WEBHOOK_HANDLES_CORE=true` — только логирует, не открывает core-сделок (это делает webhook). Latency: 5-15 минут → 5-15 секунд (×50 быстрее). Эксперимент: через 48 часов сравнить когорты `from_webhook=TRUE` vs `from_webhook=FALSE` — если webhook-когорта заметно прибыльнее, latency была главным узким местом.
+- **2026-05-11 днём**: **развернул webhook-инфру на fly.io**. Helius webhook id `c3249c3b-ef1e-4f36-82b4-4e3018814fc0` подписан на 7 ядерных кошельков. Cron-Watcher переключён в режим `WEBHOOK_HANDLES_CORE=true` — только логирует, не открывает core-сделок (это делает webhook). Latency: 5-15 минут → 5-15 секунд (×50 быстрее). Эксперимент: через 48 часов сравнить когорты `from_webhook=TRUE` vs `from_webhook=FALSE` — если webhook-когорта заметно прибыльнее, latency была главным узким местом.
 - **2026-05-11 днём**: чек-лист до live-торговли не закрыт: 15/30 закрытых core-сделок, ~3/7 дней наблюдения, нет модулей `live.py` / `safety_runtime.py` / `risk_guard.py`. Live не подключается до сходимости статистики на низкой latency.

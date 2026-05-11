@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 
@@ -43,6 +44,13 @@ MAX_TRADES_PER_POLL_PER_WALLET = 10  # cap for sanity on first run / catch-up
 MIN_CORE_BUYERS = 2
 CORE_CONVICTION_WINDOW_MIN = 30
 DEDUP_RECENT_TRADE_HOURS = 24    # don't open another paper trade on the same token within this window
+
+# When the fly.io webhook server is live, it handles core-wallet trade
+# opening (lower latency). This cron watcher then ONLY logs signals — both
+# from non-core wallets (for promotion analysis) and core wallets (so the
+# count_core_buyers query stays accurate as a fallback). Set the env var
+# WEBHOOK_HANDLES_CORE=true in the GH Actions workflow once webhook is up.
+WEBHOOK_HANDLES_CORE = os.environ.get("WEBHOOK_HANDLES_CORE", "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +266,11 @@ def run_once(database_url: str) -> tuple[int, int]:
 
                     # Paper trade only opens on core conviction.
                     if not wallet_is_core:
+                        continue
+                    if WEBHOOK_HANDLES_CORE:
+                        # fly.io webhook server has lower-latency path. Cron
+                        # keeps logging signals (already done above) but does
+                        # NOT open paper trades for core wallets.
                         continue
                     if pair is None:
                         log.warning("  no DexScreener pair for %s; signal logged but no paper trade",

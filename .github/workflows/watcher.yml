@@ -24,6 +24,11 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+          # Когда fly.io webhook активен — cron только логирует сигналы.
+          # Открытие core-сделок делает webhook (низкая latency).
+          # Cron остаётся как fallback на случай отказа webhook'а
+          # (его dedup-логика предотвратит дубликаты).
+          WEBHOOK_HANDLES_CORE: "true"
         run: |
           if [ -z "$DATABASE_URL" ] || [ -z "$HELIUS_API_KEY" ]; then
             echo "Required secrets not set; skipping."

@@ -225,6 +225,28 @@ def fetch_core_strategy_outcomes(conn):
         return cur.fetchall()
 
 
+def fetch_latency_experiment(conn):
+    """Latency experiment: webhook (fly.io, ~10s) vs cron (GH Actions, ~10min)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                CASE WHEN from_webhook THEN 'webhook (low-latency)' ELSE 'cron (10-min)' END AS source,
+                COUNT(*) AS trades,
+                COUNT(*) FILTER (WHERE status = 'open') AS open_,
+                COUNT(*) FILTER (WHERE status = 'closed_tp') AS wins,
+                COUNT(*) FILTER (WHERE status = 'closed_sl') AS losses,
+                COUNT(*) FILTER (WHERE status = 'closed_timeout') AS timeouts,
+                ROUND(AVG(pnl_pct) FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS mean_pnl,
+                ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct)
+                      FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS median_pnl
+            FROM wallet_paper_trades
+            WHERE from_core_conviction = TRUE
+            GROUP BY from_webhook
+            ORDER BY from_webhook DESC
+        """)
+        return cur.fetchall()
+
+
 def fetch_promotion_candidates(conn):
     """Non-core wallets that meet stable-trader criteria — promotion candidates.
 
@@ -315,6 +337,7 @@ def render(database_url: str, md: bool = False) -> str:
         conviction_rows = fetch_conviction_comparison(conn)
         wallet_rows = fetch_wallet_cohorts(conn)
         core_strategy_rows = fetch_core_strategy_outcomes(conn)
+        latency_rows = fetch_latency_experiment(conn)
         promotion_candidates = fetch_promotion_candidates(conn)
         core_health_rows = fetch_core_decline_candidates(conn)
 
@@ -478,6 +501,22 @@ def render(database_url: str, md: bool = False) -> str:
         parts.append((_md_table if md else _txt_table)(cols, rows))
     else:
         parts.append("  (no core-conviction trades opened yet — нужно ≥2 core-кошелька на одном токене)\n")
+
+    # ==== Latency experiment ====
+    parts.append(f"\n{H2}Latency experiment: webhook vs cron{H2_END}")
+    parts.append("  Сравнение когорт open paper trades. Одинаковая стратегия (cross-wallet ≥2 core),\n"
+                 "  одинаковые TP+18% / SL-12% / timeout 24h. Различие — только задержка детекции:\n"
+                 "  webhook ~5-15 сек, cron ~10 мин. Спред mean PnL = эффект устранения задержки.\n")
+    if latency_rows:
+        rows = []
+        for src, n, op, w, l, t, mean, median in latency_rows:
+            decided = (w or 0) + (l or 0)
+            wr = f"{int(100*w/decided)}%" if decided else "n/a"
+            rows.append([src, n, op, w, l, t, wr, _fmt_pct(mean), _fmt_pct(median)])
+        cols = ["source", "total", "open", "W", "L", "T", "wr_dec", "mean", "median"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+    else:
+        parts.append("  (нет core-сделок ни в одной когорте)\n")
 
     # ==== Core health ====
     parts.append(f"\n{H2}Health of current core wallets{H2_END}")

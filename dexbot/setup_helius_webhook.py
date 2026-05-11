@@ -55,11 +55,24 @@ def cmd_list() -> None:
         print("(нет активных webhook'ов)")
         return
     for h in hooks:
-        print(f"  id          : {h.get('webhookID')}")
+        webhook_id = h.get("webhookID")
+        # Краткий list не возвращает accountAddresses — добираем через GET /v0/webhooks/{id}
+        addrs = h.get("accountAddresses")
+        if not addrs and webhook_id:
+            try:
+                rd = requests.get(
+                    f"{HELIUS_BASE}/v0/webhooks/{webhook_id}",
+                    params={"api-key": _key()}, timeout=15,
+                )
+                if rd.ok:
+                    addrs = (rd.json() or {}).get("accountAddresses") or []
+            except Exception:
+                addrs = []
+        addrs = addrs or []
+        print(f"  id          : {webhook_id}")
         print(f"  url         : {h.get('webhookURL')}")
         print(f"  type        : {h.get('webhookType')}")
         print(f"  tx_types    : {h.get('transactionTypes')}")
-        addrs = h.get('accountAddresses') or []
         print(f"  addresses   : {len(addrs)} кошельков")
         for a in addrs[:3]:
             print(f"                 {a}")

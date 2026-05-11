@@ -263,7 +263,8 @@ def fetch_promotion_candidates(conn):
 
 
 def fetch_core_decline_candidates(conn):
-    """Core wallets whose stats now LOOK BAD — candidates to demote."""
+    """Health of core wallets. WR uses decided basis (wins / (wins + losses))
+    to be consistent with per-wallet table and the promotion criteria."""
     with conn.cursor() as cur:
         cur.execute("""
             WITH per_wallet AS (
@@ -272,6 +273,8 @@ def fetch_core_decline_candidates(conn):
                     w.score,
                     COUNT(*) FILTER (WHERE t.status LIKE 'closed%%') AS closed,
                     SUM(CASE WHEN t.status='closed_tp' THEN 1 ELSE 0 END) AS wins,
+                    SUM(CASE WHEN t.status='closed_sl' THEN 1 ELSE 0 END) AS losses,
+                    SUM(CASE WHEN t.status='closed_timeout' THEN 1 ELSE 0 END) AS timeouts,
                     ROUND(AVG(t.pnl_pct)::numeric, 1) AS mean_pnl,
                     ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY t.pnl_pct)
                           FILTER (WHERE t.status LIKE 'closed%%')::numeric, 1) AS median_pnl
@@ -280,8 +283,8 @@ def fetch_core_decline_candidates(conn):
                 WHERE w.is_core = TRUE
                 GROUP BY t.triggered_by_wallet, w.score
             )
-            SELECT wallet, closed, wins,
-                   ROUND(100.0 * wins::numeric / NULLIF(closed,0), 0) AS wr,
+            SELECT wallet, closed, wins, losses, timeouts,
+                   ROUND(100.0 * wins::numeric / NULLIF(wins+losses,0), 0) AS wr_decided,
                    mean_pnl, median_pnl, score
             FROM per_wallet
             ORDER BY median_pnl ASC NULLS LAST
@@ -478,13 +481,17 @@ def render(database_url: str, md: bool = False) -> str:
 
     # ==== Core health ====
     parts.append(f"\n{H2}Health of current core wallets{H2_END}")
+    parts.append("  WR на decided basis (без таймаутов). timeout% — доля сделок не дошедших до TP/SL за 24ч.\n")
     if core_health_rows:
         rows = []
-        for w_addr, closed, wins, wr, mean_pnl, median_pnl, score in core_health_rows:
+        for w_addr, closed, wins, losses, timeouts, wr, mean_pnl, median_pnl, score in core_health_rows:
             wr_s = f"{int(wr)}%" if wr is not None else "n/a"
-            rows.append([w_addr[:14] + "…", closed, wins, wr_s,
+            timeout_pct = f"{int(100.0 * timeouts / closed)}%" if closed else "n/a"
+            rows.append([w_addr[:14] + "…", closed, wins, losses, timeouts,
+                         wr_s, timeout_pct,
                          _fmt_pct(mean_pnl), _fmt_pct(median_pnl), float(score or 0)])
-        cols = ["wallet", "closed", "wins", "win_rate", "mean_pnl", "median", "score"]
+        cols = ["wallet", "closed", "W", "L", "T",
+                "wr_decided", "timeout%", "mean", "median", "score"]
         parts.append((_md_table if md else _txt_table)(cols, rows))
     else:
         parts.append("  (no core wallets defined)\n")

@@ -12,17 +12,18 @@
 
 Открытием core-сделок занимается **fly.io webhook-сервер** на push-сигналах Helius (latency ~5-15 сек). GitHub Actions cron-Watcher остаётся как fallback и для логирования сигналов от не-core кошельков.
 
-## Текущее ядро (7 кошельков)
+## Текущее ядро (6 кошельков, BioBT877 демотирован 2026-05-12)
 
 | Кошелёк | Закрыто | WR (без таймаутов) | Медиана PnL | Замечание |
 |---|---:|---:|---:|---|
-| `GvyLS9WFxUBzoiVPKTJAR2bGLocnoEVWRYh4D8i5z7m1` | 183 | **87%** | +33.9% | звезда |
-| `BSfQT2AmdxQfpsGQANrcYEUcwta5PWuTfBkHxqsZ3Gz8` | 81 | **79%** | +26.1% | звезда |
-| `BioBT877DVAo7DD6MVaYkMyGZ7qUQ3Lthn5cqyGG6ons` | 54 | 54% | +18.5% | стабильный, 0% таймаутов |
-| `D9LcgmcrfNUg8nS9YHqe2H6eSyK9GBE5R5BMkwNarCe3` | 243 | 53% | +10.4% | стабильный, большая выборка |
-| `8L2y55D11k63CAftvW7uMM2mBhtMxLoLnivG9uY2bt8j` | 445 | 55% | +2.6% | лотерейный, mean +63% |
-| `SHARKRdGLNYRZrhotqvZi3XAtT62CRGCFxmg5LJgSHC` | 173 | 53% | +2.6% | лотерейный, mean +170% |
-| `ESuvjvsQtjuxC4XGsDeMhx8Wp5yjQcCFGncGhupcJbg8` | 254 | 60% | +1.7% | 68% таймаутов, на испытательном сроке |
+| `GvyLS9WFxUBzoiVPKTJAR2bGLocnoEVWRYh4D8i5z7m1` | 185 | **87%** | +28.1% | звезда |
+| `BSfQT2AmdxQfpsGQANrcYEUcwta5PWuTfBkHxqsZ3Gz8` | 82 | **79%** | +18.1% | сильный |
+| `D9LcgmcrfNUg8nS9YHqe2H6eSyK9GBE5R5BMkwNarCe3` | 267 | 52% | +5.6% | стабильный, большая выборка |
+| `8L2y55D11k63CAftvW7uMM2mBhtMxLoLnivG9uY2bt8j` | 454 | 55% | +2.7% | лотерейный, mean +62% |
+| `SHARKRdGLNYRZrhotqvZi3XAtT62CRGCFxmg5LJgSHC` | 180 | 50% | +2.4% | лотерейный, mean +163% |
+| `ESuvjvsQtjuxC4XGsDeMhx8Wp5yjQcCFGncGhupcJbg8` | 268 | 57% | +1.3% | 67% таймаутов, медленные сигналы |
+
+**Демотирован 2026-05-12**: `BioBT877` — на 79 закрытых WR упал до 43%, медиана −12.5%. Демотация по критерию.
 
 ## Критерии управления core-набором
 
@@ -108,3 +109,5 @@ curl https://dexbot-webhook.fly.dev/core
 - **2026-05-11 утром**: тот же баг WR-метрики оказался и в разделе Health of current core wallets — починил, добавил колонку timeout%. Обнаружил что у ESuvjvsQ 68% сделок завершаются таймаутом (медленные сигналы) — оставил на испытательном сроке.
 - **2026-05-11 днём**: **развернул webhook-инфру на fly.io**. Helius webhook id `c3249c3b-ef1e-4f36-82b4-4e3018814fc0` подписан на 7 ядерных кошельков. Cron-Watcher переключён в режим `WEBHOOK_HANDLES_CORE=true` — только логирует, не открывает core-сделок (это делает webhook). Latency: 5-15 минут → 5-15 секунд (×50 быстрее). Эксперимент: через 48 часов сравнить когорты `from_webhook=TRUE` vs `from_webhook=FALSE` — если webhook-когорта заметно прибыльнее, latency была главным узким местом.
 - **2026-05-11 днём**: чек-лист до live-торговли не закрыт: 15/30 закрытых core-сделок, ~3/7 дней наблюдения, нет модулей `live.py` / `safety_runtime.py` / `risk_guard.py`. Live не подключается до сходимости статистики на низкой latency.
+- **2026-05-12 утром**: первая полная итерация latency-эксперимента. **Webhook (10 сек) проиграл cron'у (10 мин) по всем метрикам**: WR 21% vs 59%, mean −2.7% vs +9.6%. Гипотеза: cron-задержка работает как фильтр ложных конвикций. Параллельно: core-стратегия в целом на +1.8% mean (слабо), BioBT877 обвалился до медианы −12.5%.
+- **2026-05-12 днём**: **запущен delayed-webhook эксперимент**. Логика: webhook принимает событие мгновенно, инсертит сигнал, ставит в очередь `pending_trades` с задержкой 5 мин. Asyncio worker через 5 мин перепроверяет conviction → открывает или дропает. Эмулируем cron-фильтрацию без потери преимущества по latency. **BioBT877 демотирован из ядра**. Ядро сократилось до 6. Helius webhook пересинхронизирован. Deploy на fly.io прошёл со 2-й попытки (`--strategy immediate`).

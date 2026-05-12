@@ -18,6 +18,7 @@ Environment:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -55,6 +56,13 @@ DEDUP_RECENT_TRADE_HOURS = 24
 TP_PCT = 18.0
 SL_PCT = -12.0
 POLL_LOOKBACK_HOURS = 1  # ignore events older than this
+
+# Delayed-webhook эксперимент.
+# Гипотеза: cron работает лучше потому что "поздняя" детекция отфильтровывает
+# ложные сигналы. Эмулируем это: получаем core-событие → ждём WEBHOOK_DELAY_MIN
+# минут → проверяем что conviction всё ещё актуальна → открываем paper-trade.
+WEBHOOK_DELAY_MIN = int(os.environ.get("WEBHOOK_DELAY_MIN", "5"))
+PENDING_WORKER_INTERVAL_SEC = 30
 
 app = FastAPI(title="dexbot-webhook")
 
@@ -160,7 +168,8 @@ def insert_signal(conn, *, wallet: str, ev, ever_passed: bool | None,
 
 def open_paper_trade(conn, *, signal_id: int, token_address: str,
                      symbol: str | None, wallet: str,
-                     entry_price: float) -> int | None:
+                     entry_price: float,
+                     webhook_delay_min: int | None = None) -> int | None:
     if entry_price <= 0:
         return None
     stop = entry_price * (1 + SL_PCT / 100.0)
@@ -171,13 +180,34 @@ def open_paper_trade(conn, *, signal_id: int, token_address: str,
             INSERT INTO wallet_paper_trades (
                 signal_id, chain, token_address, symbol, triggered_by_wallet,
                 entry_price_usd, stop_price_usd, take_price_usd,
-                from_core_conviction, from_webhook
+                from_core_conviction, from_webhook, webhook_delay_min
             )
-            VALUES (%s, 'solana', %s, %s, %s, %s, %s, %s, TRUE, TRUE)
+            VALUES (%s, 'solana', %s, %s, %s, %s, %s, %s, TRUE, TRUE, %s)
             ON CONFLICT (signal_id) DO NOTHING
             RETURNING id
             """,
-            (signal_id, token_address, symbol, wallet, entry_price, stop, take),
+            (signal_id, token_address, symbol, wallet, entry_price, stop, take,
+             webhook_delay_min),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+
+def enqueue_pending_trade(conn, *, signal_id: int, token_address: str,
+                          wallet: str, delay_min: int) -> int | None:
+    """Поставить запрос на отложенное открытие paper-сделки в очередь."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO pending_trades (
+                signal_id, chain, token_address, triggered_by_wallet,
+                open_after_at
+            )
+            VALUES (%s, 'solana', %s, %s, NOW() + (%s || ' minutes')::interval)
+            ON CONFLICT (signal_id) DO NOTHING
+            RETURNING id
+            """,
+            (signal_id, token_address, wallet, str(delay_min)),
         )
         row = cur.fetchone()
         return row[0] if row else None
@@ -278,18 +308,16 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
         result["skip"] = "dedup"
         return result
 
-    if price is None:
-        conn.commit()
-        result["skip"] = "no_price"
-        return result
-
-    trade_id = open_paper_trade(
+    # Delayed open: запрос в очередь на открытие через WEBHOOK_DELAY_MIN минут.
+    # Pending worker сам перепроверит conviction и dedup в момент открытия.
+    # Цена будет взята на момент исполнения (а не сейчас).
+    pending_id = enqueue_pending_trade(
         conn, signal_id=sig_id, token_address=ev.token_mint,
-        symbol=symbol, wallet=wallet, entry_price=price,
+        wallet=wallet, delay_min=WEBHOOK_DELAY_MIN,
     )
     conn.commit()
-    result["trade_id"] = trade_id
-    result["entry_price"] = price
+    result["pending_id"] = pending_id
+    result["delay_min"] = WEBHOOK_DELAY_MIN
     return result
 
 
@@ -324,8 +352,95 @@ def process_payload(payload: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pending-trade worker
+# ---------------------------------------------------------------------------
+
+def decide_pending(conn, pending_id: int, signal_id: int, token_address: str,
+                   wallet: str, core_set: set[str]) -> tuple[str, int | None, str | None]:
+    """Returns (decision, trade_id_or_None, error_or_None)."""
+    try:
+        # Re-check conviction NOW, после WEBHOOK_DELAY_MIN минут
+        n_buyers = count_core_buyers(conn, token_address, core_set)
+        if n_buyers < MIN_CORE_BUYERS:
+            return "dropped_no_conviction", None, None
+        if has_recent_trade(conn, token_address):
+            return "dropped_dedup", None, None
+        price, symbol = fetch_sol_price(token_address)
+        if price is None:
+            return "dropped_no_price", None, None
+        trade_id = open_paper_trade(
+            conn, signal_id=signal_id, token_address=token_address,
+            symbol=symbol, wallet=wallet, entry_price=price,
+            webhook_delay_min=WEBHOOK_DELAY_MIN,
+        )
+        return "opened", trade_id, None
+    except Exception as e:
+        log.exception("decide_pending failed for pending_id=%s", pending_id)
+        return "dropped_error", None, str(e)[:500]
+
+
+def process_pending_batch() -> dict[str, int]:
+    """Sync batch processor — вызывается из worker'а через asyncio.to_thread."""
+    counts: dict[str, int] = {}
+    with _conn() as conn:
+        core_set = fetch_core_set(conn)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, signal_id, chain, token_address, triggered_by_wallet
+                FROM pending_trades
+                WHERE processed_at IS NULL AND open_after_at <= NOW()
+                ORDER BY open_after_at
+                LIMIT 50
+                """
+            )
+            pending = cur.fetchall()
+        if not pending:
+            return counts
+
+        log.info("processing %d pending trades", len(pending))
+        for p_id, sig_id, _chain, addr, wallet in pending:
+            decision, trade_id, error = decide_pending(
+                conn, p_id, sig_id, addr, wallet, core_set
+            )
+            counts[decision] = counts.get(decision, 0) + 1
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE pending_trades
+                    SET processed_at = NOW(), decision = %s, trade_id = %s, error = %s
+                    WHERE id = %s
+                    """,
+                    (decision, trade_id, error, p_id),
+                )
+            conn.commit()
+            if decision == "opened":
+                log.info("  OPENED pending=%d trade=%s wallet=%s token=%s",
+                         p_id, trade_id, wallet[:8], addr[:8])
+    return counts
+
+
+async def pending_worker() -> None:
+    """Бесконечный воркер — обрабатывает pending_trades каждые N секунд."""
+    log.info("pending_worker started (interval=%ds, delay=%dmin)",
+             PENDING_WORKER_INTERVAL_SEC, WEBHOOK_DELAY_MIN)
+    while True:
+        try:
+            counts = await asyncio.to_thread(process_pending_batch)
+            if counts:
+                log.info("  batch done: %s", counts)
+        except Exception:
+            log.exception("pending_worker iteration failed")
+        await asyncio.sleep(PENDING_WORKER_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
 # HTTP routes
 # ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    asyncio.create_task(pending_worker())
 
 @app.get("/health")
 def health():
@@ -356,5 +471,33 @@ def core():
         with _conn() as conn:
             core_set = fetch_core_set(conn)
         return {"count": len(core_set), "addresses": sorted(core_set)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/pending")
+def pending_stats():
+    """Состояние очереди отложенных открытий."""
+    try:
+        with _conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE processed_at IS NULL) AS waiting,
+                    COUNT(*) FILTER (WHERE processed_at IS NOT NULL) AS done,
+                    COUNT(*) FILTER (WHERE decision = 'opened') AS opened,
+                    COUNT(*) FILTER (WHERE decision LIKE 'dropped_%') AS dropped,
+                    MAX(open_after_at) FILTER (WHERE processed_at IS NULL) AS next_at
+                FROM pending_trades
+                """
+            )
+            row = cur.fetchone()
+        return {
+            "delay_min": WEBHOOK_DELAY_MIN,
+            "worker_interval_sec": PENDING_WORKER_INTERVAL_SEC,
+            "waiting": row[0], "done": row[1],
+            "opened": row[2], "dropped": row[3],
+            "next_open_after_at": str(row[4]) if row[4] else None,
+        }
     except Exception as e:
         return {"error": str(e)}

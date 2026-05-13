@@ -18,7 +18,7 @@ concurrency:
 jobs:
   rescore:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -37,7 +37,12 @@ jobs:
           fi
           echo ">>> Harvest new candidates from recent pools"
           python -m dexbot.discovery harvest --max-pools 50 --days 14
-          echo ">>> Score all active wallets"
-          python -m dexbot.discovery score --all --days "${{ inputs.days || 30 }}"
+          echo ">>> Score only stale/new wallets (cap 100 per run)"
+          # --stale-only: scores wallets never scored OR last_scored_at > 7 days ago.
+          # --max 100:    hard cap to keep runtime predictable as watch-list grows.
+          # Старые ещё актуальные оценки не трогаем — экономим Helius credits
+          # и укладываемся в 25-минутный таймаут даже на 200+ wallet'ов в БД.
+          python -m dexbot.discovery score --all --stale-only --max 100 \
+            --days "${{ inputs.days || 30 }}"
           echo ">>> Top 30 ranked"
           python -m dexbot.discovery list --limit 30

@@ -168,6 +168,32 @@ def fetch_active_addresses(conn) -> list[str]:
         return [r[0] for r in cur.fetchall()]
 
 
+def fetch_addresses_to_score(conn, *, stale_after_hours: int = 168,
+                             max_count: int | None = None) -> list[str]:
+    """Возвращает адреса для score, приоритизированные:
+    1. Никогда не оценивались (last_scored_at IS NULL) → первый эшелон
+    2. Устаревшие (last_scored_at старше stale_after_hours, по умолчанию 7 дней)
+    3. Внутри каждого эшелона — самые старые last_scored_at сначала
+
+    Это даёт стабильное время выполнения score-all при растущем watch-листе.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT address
+            FROM watched_wallets
+            WHERE is_active = TRUE
+              AND (
+                last_scored_at IS NULL
+                OR last_scored_at < NOW() - INTERVAL '{stale_after_hours} hours'
+              )
+            ORDER BY (last_scored_at IS NULL) DESC, last_scored_at ASC NULLS FIRST
+            {"LIMIT " + str(int(max_count)) if max_count else ""}
+            """,
+        )
+        return [r[0] for r in cur.fetchall()]
+
+
 def upsert_score(conn, stats: WalletStats) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -281,6 +307,12 @@ def main(argv: list[str] | None = None) -> int:
     p_sc_grp.add_argument("--wallet", help="Score a single wallet.")
     p_sc_grp.add_argument("--all", action="store_true", help="Score all active wallets.")
     p_sc.add_argument("--days", type=int, default=DEFAULT_WINDOW_DAYS)
+    p_sc.add_argument("--stale-only", action="store_true",
+                      help="Only score wallets unscored or older than --stale-after-hours.")
+    p_sc.add_argument("--stale-after-hours", type=int, default=168,
+                      help="Re-score threshold for --stale-only (default: 168h = 7d).")
+    p_sc.add_argument("--max", type=int, default=None,
+                      help="Cap number of wallets scored in one run.")
 
     p_h = sub.add_parser(
         "harvest",
@@ -332,12 +364,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "score":
             if args.wallet:
                 addresses = [args.wallet]
+            elif args.stale_only:
+                addresses = fetch_addresses_to_score(
+                    conn,
+                    stale_after_hours=args.stale_after_hours,
+                    max_count=args.max,
+                )
             else:
                 addresses = fetch_active_addresses(conn)
+                if args.max is not None:
+                    addresses = addresses[:args.max]
             if not addresses:
-                print("no active wallets to score — add some with `discovery add ADDR`")
+                print("no wallets need scoring — все актуальны или watch-список пуст")
                 return 0
-            print(f"scoring {len(addresses)} wallet(s) over {args.days}d window")
+            mode = "stale-only" if args.stale_only else "all"
+            print(f"scoring {len(addresses)} wallet(s) over {args.days}d window  [mode={mode}]")
             for addr in addresses:
                 try:
                     stats = score_wallet(conn, addr, days=args.days)

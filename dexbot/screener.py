@@ -167,6 +167,18 @@ def run_once(config: Config, *, dry_run: bool) -> int:
                 db.upsert_safety_cache(conn, r["chain"], r["address"], r["safety"])
         conn.commit()
         log.info("persisted %d rows to candidates", len(results))
+
+    # Гипотеза C: после записи candidates — открываем screener-only paper-сделки
+    # для свежих passed-кандидатов. Независимая когорта, отдельная таблица.
+    try:
+        from . import screener_trader
+        opened, skipped = screener_trader.open_screener_trades(config.database_url)
+        log.info("screener-trader: opened=%d skipped=%d", opened, skipped)
+        n_closed = screener_trader.monitor_screener_trades(config.database_url)
+        log.info("screener-trader monitor: closed=%d", n_closed)
+    except Exception as e:
+        log.warning("screener_trader pass failed: %s", e)
+
     return 0
 
 

@@ -36,6 +36,7 @@ from fastapi.responses import JSONResponse
 load_dotenv()
 
 from .parser import parse_swap  # noqa: E402
+from . import onchain  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -142,16 +143,20 @@ def token_metadata(conn, addr: str) -> tuple[bool | None, str | None]:
 
 
 def insert_signal(conn, *, wallet: str, ev, ever_passed: bool | None,
-                  in_candidates: bool, symbol: str | None) -> int | None:
+                  in_candidates: bool, symbol: str | None,
+                  pool_address: str | None = None,
+                  pool_age_at_signal_min: int | None = None) -> int | None:
     with conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO wallet_signals (
                 wallet, signature, block_time, action, chain, token_address,
                 token_symbol, token_amount, quote_mint, quote_amount, sol_amount,
-                candidate_passed, in_candidates, raw
+                candidate_passed, in_candidates, raw,
+                pool_address, pool_age_at_signal_min
             )
-            VALUES (%s, %s, to_timestamp(%s), %s, 'solana', %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            VALUES (%s, %s, to_timestamp(%s), %s, 'solana', %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                    %s, %s)
             ON CONFLICT (wallet, signature, action, token_address) DO NOTHING
             RETURNING id
             """,
@@ -160,6 +165,7 @@ def insert_signal(conn, *, wallet: str, ev, ever_passed: bool | None,
                 ev.token_amount, ev.quote_mint, ev.quote_amount, ev.sol_amount,
                 ever_passed, in_candidates,
                 json.dumps({"source": ev.source, "via": "webhook"}),
+                pool_address, pool_age_at_signal_min,
             ),
         )
         row = cur.fetchone()
@@ -339,9 +345,20 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
     price, pair_symbol = fetch_sol_price(ev.token_mint)
     symbol = cand_symbol or pair_symbol
 
+    # Observational: захватываем pool_address из tx + pool_age_at_signal_min.
+    # Не влияет на trading-логику. Использует кэш — повторные запросы дешёвые.
+    pool_addr: Optional[str] = None
+    pool_age: Optional[int] = None
+    try:
+        pool_addr = onchain.pool_address_from_tx(tx)
+        pool_age = onchain.fetch_pool_age_min_at(ev.token_mint, ev.timestamp, conn=conn)
+    except Exception as e:
+        log.warning("pool_age capture failed for %s: %s", ev.token_mint[:8], e)
+
     sig_id = insert_signal(
         conn, wallet=wallet, ev=ev,
         ever_passed=ever_passed, in_candidates=in_cand, symbol=symbol,
+        pool_address=pool_addr, pool_age_at_signal_min=pool_age,
     )
     if sig_id is None:
         conn.commit()

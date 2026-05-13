@@ -17,13 +17,26 @@
 ┌──────────────┐              ┌──────────────────┐          ┌──────────────────┐
 │  SCREENER    │              │ WEBHOOK SERVER   │          │   DISCOVERY      │
 │  (GH Actions │              │  (fly.io, FastAPI)│          │   (GH Actions    │
-│   каждые 5м) │              │                  │          │    еженедельно)  │
+│   каждые 5м) │              │  + pool_age cap. │          │    еженедельно)  │
 └──────┬───────┘              └────────┬─────────┘          └────────┬─────────┘
-       │                               │                              │
-       ▼                               ▼                              ▼
-   candidates                  wallet_signals                  watched_wallets
-   таблица                     + pending_trades                таблица
-                               + wallet_paper_trades
+       │ ───┐                          │                              │
+       ▼    │                          ▼                              ▼
+   candidates  │              wallet_signals                  watched_wallets
+   таблица     │              (+ pool_age, pool_addr)         таблица
+               │              + pending_trades
+               │              + wallet_paper_trades
+               │                       │                              ▲
+       ▼       │                       │                              │
+┌──────────────▼┐                      │                ┌─────────────┴──┐
+│ SCREENER-     │                      │                │ POOL METADATA  │
+│ TRADER (C)    │                      │                │ кэш creation_ts│
+│ (в screener.py│                      │                │ DexScrn+Helius │
+│  после persist│                      │                └────────────────┘
+└──────┬────────┘                      │
+       │                               │
+       ▼                               │
+screener_paper_trades                  │
+(независимая когорта)                  │
        │                               │
        ▼                               │
 ┌──────────────┐                       │
@@ -279,9 +292,22 @@ Neon Postgres (free tier 0.5 GB)
 ├── watched_wallets         — Pool потенциальных смарт-мани
 │   └── is_core flag        — Подмножество "ядра" (сейчас 6)
 ├── wallet_signals          — Каждое buy/sell-событие наших кошельков
-├── wallet_paper_trades     — Бумажные позиции
-└── pending_trades          — Очередь отложенных открытий (delayed-webhook)
+│   └── pool_age_at_signal_min, pool_address (мигр. 008)
+├── wallet_paper_trades     — Бумажные позиции (wallet-conviction когорта)
+├── pending_trades          — Очередь отложенных открытий (delayed-webhook)
+├── pool_metadata           — Кэш creation_ts для токенов (мигр. 008)
+└── screener_paper_trades   — Независимая когорта (Гипотеза C, мигр. 009)
 ```
+
+## Параллельные эксперименты (с 2026-05-13)
+
+| ID | Гипотеза | Тип | Изоляция |
+|---|---|---|---|
+| **A** | Latency 5 → 15 минут как фильтр ложных конвикций | trading change | через `WEBHOOK_DELAY_MIN` env на fly.io |
+| **B** | Pool age на момент сигнала объяснит почему core-сделки убыточны | observational | новые колонки в `wallet_signals`, никакая trading-логика не меняется |
+| **C** | Screener-only сам по себе прибыльная стратегия (без wallet-conviction) | independent strategy | отдельная таблица `screener_paper_trades`, своя open/monitor логика, без следующих |
+
+Все три можно сравнивать одновременно — они не конфликтуют.
 
 ## Эксперимент latency (активен с 2026-05-12)
 

@@ -284,6 +284,109 @@ def fetch_promotion_candidates(conn):
         return cur.fetchall()
 
 
+def fetch_pool_age_per_wallet(conn):
+    """Гипотеза B: распределение pool_age на момент сигнала по core-wallets."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              s.wallet,
+              COUNT(*) AS n_with_age,
+              ROUND(percentile_cont(0.25) WITHIN GROUP (ORDER BY s.pool_age_at_signal_min)::numeric, 0) AS p25,
+              ROUND(percentile_cont(0.50) WITHIN GROUP (ORDER BY s.pool_age_at_signal_min)::numeric, 0) AS p50,
+              ROUND(percentile_cont(0.75) WITHIN GROUP (ORDER BY s.pool_age_at_signal_min)::numeric, 0) AS p75,
+              SUM(CASE WHEN s.pool_age_at_signal_min < 5 THEN 1 ELSE 0 END) AS lt5min,
+              SUM(CASE WHEN s.pool_age_at_signal_min >= 5 AND s.pool_age_at_signal_min < 60 THEN 1 ELSE 0 END) AS lt1h,
+              SUM(CASE WHEN s.pool_age_at_signal_min >= 60 THEN 1 ELSE 0 END) AS gte1h
+            FROM wallet_signals s
+            JOIN watched_wallets w ON w.address = s.wallet AND w.is_core = TRUE
+            WHERE s.action = 'buy' AND s.pool_age_at_signal_min IS NOT NULL
+            GROUP BY s.wallet
+            ORDER BY n_with_age DESC
+        """)
+        return cur.fetchall()
+
+
+def fetch_pool_age_pnl_split(conn):
+    """Гипотеза B: PnL paper-сделок где сигнал был на свежем (<5min) пуле vs зрелом."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH joined AS (
+                SELECT
+                    t.id, t.pnl_pct, t.status, s.pool_age_at_signal_min AS age_min
+                FROM wallet_paper_trades t
+                JOIN wallet_signals s ON s.id = t.signal_id
+                WHERE t.from_core_conviction = TRUE
+                  AND s.pool_age_at_signal_min IS NOT NULL
+            )
+            SELECT
+              CASE
+                WHEN age_min < 5 THEN '< 5 min (fresh pool)'
+                WHEN age_min < 60 THEN '5-60 min'
+                WHEN age_min < 360 THEN '1-6 hours'
+                ELSE '>= 6 hours (mature)'
+              END AS bucket,
+              COUNT(*) FILTER (WHERE status LIKE 'closed%%') AS closed,
+              SUM(CASE WHEN status = 'closed_tp' THEN 1 ELSE 0 END) AS wins,
+              SUM(CASE WHEN status = 'closed_sl' THEN 1 ELSE 0 END) AS losses,
+              ROUND(AVG(pnl_pct) FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS mean,
+              ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct)
+                    FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS median
+            FROM joined
+            GROUP BY 1
+            ORDER BY MIN(COALESCE(age_min, 0))
+        """)
+        return cur.fetchall()
+
+
+def fetch_screener_paper_outcomes(conn):
+    """Гипотеза C: результаты screener-only paper trades."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              status, COUNT(*),
+              ROUND(AVG(pnl_pct)::numeric, 1),
+              ROUND(MIN(pnl_pct)::numeric, 1),
+              ROUND(MAX(pnl_pct)::numeric, 1),
+              ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct)::numeric, 1)
+            FROM screener_paper_trades
+            GROUP BY status ORDER BY COUNT(*) DESC
+        """)
+        return cur.fetchall()
+
+
+def fetch_cohort_comparison(conn):
+    """Сравнение wallet-conviction (core-trades) vs screener-only (screener-trades)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            WITH wallet_cohort AS (
+              SELECT 'wallet-conviction' AS cohort,
+                     COUNT(*) AS total,
+                     COUNT(*) FILTER (WHERE status = 'open') AS open_,
+                     COUNT(*) FILTER (WHERE status = 'closed_tp') AS wins,
+                     COUNT(*) FILTER (WHERE status = 'closed_sl') AS losses,
+                     ROUND(AVG(pnl_pct) FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS mean,
+                     ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct)
+                           FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS median
+              FROM wallet_paper_trades WHERE from_core_conviction = TRUE
+            ),
+            screener_cohort AS (
+              SELECT 'screener-only' AS cohort,
+                     COUNT(*) AS total,
+                     COUNT(*) FILTER (WHERE status = 'open') AS open_,
+                     COUNT(*) FILTER (WHERE status = 'closed_tp') AS wins,
+                     COUNT(*) FILTER (WHERE status = 'closed_sl') AS losses,
+                     ROUND(AVG(pnl_pct) FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS mean,
+                     ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct)
+                           FILTER (WHERE status LIKE 'closed%%')::numeric, 1) AS median
+              FROM screener_paper_trades
+            )
+            SELECT * FROM wallet_cohort
+            UNION ALL
+            SELECT * FROM screener_cohort
+        """)
+        return cur.fetchall()
+
+
 def fetch_core_decline_candidates(conn):
     """Health of core wallets. WR uses decided basis (wins / (wins + losses))
     to be consistent with per-wallet table and the promotion criteria."""
@@ -340,6 +443,11 @@ def render(database_url: str, md: bool = False) -> str:
         latency_rows = fetch_latency_experiment(conn)
         promotion_candidates = fetch_promotion_candidates(conn)
         core_health_rows = fetch_core_decline_candidates(conn)
+        # Гипотеза B + C новые секции
+        pool_age_per_wallet = fetch_pool_age_per_wallet(conn)
+        pool_age_pnl_split = fetch_pool_age_pnl_split(conn)
+        screener_paper_rows = fetch_screener_paper_outcomes(conn)
+        cohort_comparison_rows = fetch_cohort_comparison(conn)
 
     # Compute headline numbers
     def _agg(rows, status):
@@ -549,6 +657,59 @@ def render(database_url: str, md: bool = False) -> str:
         parts.append("  Чтобы добавить в core: `python -m dexbot.discovery promote ADDR`\n")
     else:
         parts.append("  (пока нет достойных кандидатов — нужно ≥100 закрытых сделок на кошельке)\n")
+
+    # ==== Гипотеза B: Pool age per core wallet ====
+    parts.append(f"\n{H2}Pool age per core wallet (Гипотеза B){H2_END}")
+    parts.append("  Возраст пула в МИНУТАХ на момент покупки core-кошельком.\n"
+                 "  Свежие пулы (<5 мин) = снайперский вход, мы их не догоняем по latency.\n"
+                 "  Зрелые пулы (>60 мин) = воспроизводимы — успели проиндексироваться, цена стабильна.\n")
+    if pool_age_per_wallet:
+        rows = []
+        for wallet, n, p25, p50, p75, lt5, lt1h, gte1h in pool_age_per_wallet:
+            rows.append([wallet[:14] + "…", n, int(p25 or 0), int(p50 or 0), int(p75 or 0),
+                         lt5, lt1h, gte1h])
+        cols = ["wallet", "n", "p25_min", "median_min", "p75_min", "<5min", "5-60min", "≥1h"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+    else:
+        parts.append("  (нет данных — запусти `python -m dexbot.backfill_pool_age --core-only`)\n")
+
+    parts.append(f"\n{H2}Pool age × PnL split (Гипотеза B){H2_END}")
+    parts.append("  Core-сделки разбитые по возрасту пула на момент сигнала.\n"
+                 "  Если sweet-spot выявит себя — это станет фильтром.\n")
+    if pool_age_pnl_split:
+        rows = []
+        for bucket, closed, wins, losses, mean, median in pool_age_pnl_split:
+            decided = (wins or 0) + (losses or 0)
+            wr = f"{int(100*wins/decided)}%" if decided else "n/a"
+            rows.append([bucket, closed or 0, wins or 0, losses or 0, wr,
+                         _fmt_pct(mean), _fmt_pct(median)])
+        cols = ["pool age bucket", "closed", "W", "L", "WR", "mean_pnl", "median"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+    else:
+        parts.append("  (нет данных — paper-сделки ещё без связанной pool_age колонки)\n")
+
+    # ==== Гипотеза C: Screener-only paper trades ====
+    parts.append(f"\n{H2}Screener-only paper trades (Гипотеза C){H2_END}")
+    parts.append("  Независимая когорта: открываем сделку на КАЖДЫЙ passed-кандидат "
+                 "(не связано с wallet-conviction). TP +18% / SL −12% / max_hold 168h.\n")
+    if screener_paper_rows:
+        rows = [[s, n, _fmt_pct(avg), _fmt_pct(worst), _fmt_pct(best), _fmt_pct(med)]
+                for s, n, avg, worst, best, med in screener_paper_rows]
+        cols = ["status", "n", "mean_pnl", "worst", "best", "median"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+    else:
+        parts.append("  (нет сделок — screener_trader подключится при следующем screener-cron tick)\n")
+
+    parts.append(f"\n{H2}Cohort comparison: wallet-conviction vs screener-only{H2_END}")
+    if cohort_comparison_rows:
+        rows = []
+        for cohort, total, op, wins, losses, mean, median in cohort_comparison_rows:
+            decided = (wins or 0) + (losses or 0)
+            wr = f"{int(100*wins/decided)}%" if decided else "n/a"
+            rows.append([cohort, total or 0, op or 0, wins or 0, losses or 0, wr,
+                         _fmt_pct(mean), _fmt_pct(median)])
+        cols = ["cohort", "total", "open", "W", "L", "WR", "mean_pnl", "median"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
 
     # ==== Verdict ====
     parts.append(f"\n{H2}Read this as{H2_END}")

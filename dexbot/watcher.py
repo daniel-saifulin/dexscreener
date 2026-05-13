@@ -35,7 +35,11 @@ log = logging.getLogger("dexbot.watcher")
 POLL_LOOKBACK_HOURS = 6     # ignore signals older than this on first poll
 TP_PCT = 18.0
 SL_PCT = -12.0
-TIMEOUT_HOURS = 24
+# 168h = 7 дней — hard sanity-лимит. До 2026-05-13 было 24ч. Изменён вместе с
+# добавлением follower-exit логики: теперь основной выход — wallet продал
+# (`closed_wallet_sold`), а таймаут — только последняя страховка для случаев
+# когда мы пропустили sell-событие через webhook.
+TIMEOUT_HOURS = 168
 MIN_WALLET_SCORE = 30.0
 MAX_TRADES_PER_POLL_PER_WALLET = 10  # cap for sanity on first run / catch-up
 
@@ -378,7 +382,8 @@ def monitor_open_trades(database_url: str) -> int:
                 elif cur_price >= float(take):
                     exit_price, status = cur_price, "closed_tp"
                 elif age_hours > TIMEOUT_HOURS:
-                    exit_price, status = cur_price, "closed_timeout"
+                    # 168h hard limit — последняя страховка, основной выход — wallet sold.
+                    exit_price, status = cur_price, "closed_max_hold"
 
                 if exit_price is None:
                     continue

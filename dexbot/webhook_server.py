@@ -261,6 +261,56 @@ def identify_wallet(tx: dict, core_set: set[str]) -> str | None:
     return None
 
 
+def process_sell_event(conn, ev, wallet: str) -> dict[str, Any]:
+    """When core wallet SELLS a token — close any open paper trades that
+    this wallet's earlier buy triggered. Mirrors the wallet's exit decision.
+
+    Trade closes at current DexScreener price with status='closed_wallet_sold'.
+    """
+    sig = ev.signature[:12]
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, entry_price_usd, symbol
+            FROM wallet_paper_trades
+            WHERE status = 'open'
+              AND chain = 'solana'
+              AND token_address = %s
+              AND triggered_by_wallet = %s
+            """,
+            (ev.token_mint, wallet),
+        )
+        trades = cur.fetchall()
+
+    if not trades:
+        return {"sig": sig, "skip": "sell_no_open_trade", "wallet": wallet[:8]}
+
+    price, _ = fetch_sol_price(ev.token_mint)
+    if price is None:
+        return {"sig": sig, "skip": "sell_no_price", "wallet": wallet[:8]}
+
+    closed = []
+    for trade_id, entry, symbol in trades:
+        pnl_pct = (price - float(entry)) / float(entry) * 100.0
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE wallet_paper_trades
+                SET closed_at = NOW(), exit_price_usd = %s,
+                    status = 'closed_wallet_sold', pnl_pct = %s,
+                    reason_out = 'wallet_sold'
+                WHERE id = %s AND status = 'open'
+                """,
+                (price, pnl_pct, trade_id),
+            )
+            if cur.rowcount > 0:
+                closed.append(trade_id)
+                log.info("  FOLLOWER EXIT: trade=%d wallet=%s token=%s pnl=%+.1f%%",
+                         trade_id, wallet[:8], symbol or ev.token_mint[:8], pnl_pct)
+    conn.commit()
+    return {"sig": sig, "closed_trades": closed, "wallet": wallet[:8], "exit_price": price}
+
+
 def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
     """Process a single Helius enhanced tx. Returns a status dict for logging."""
     sig = tx.get("signature", "?")[:12]
@@ -275,6 +325,11 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
     ev = parse_swap(tx, wallet)
     if ev is None:
         return {"sig": sig, "skip": "not_a_swap"}
+
+    # SELL: follower-exit логика — закрываем наши открытые сделки от этого кошелька
+    if ev.action == "sell":
+        return process_sell_event(conn, ev, wallet)
+
     if ev.action != "buy":
         return {"sig": sig, "skip": f"action_{ev.action}"}
 

@@ -168,16 +168,19 @@ def run_once(config: Config, *, dry_run: bool) -> int:
         conn.commit()
         log.info("persisted %d rows to candidates", len(results))
 
-    # Гипотеза C: после записи candidates — открываем screener-only paper-сделки
-    # для свежих passed-кандидатов. Независимая когорта, отдельная таблица.
+    # Гипотеза C — DISCONFIRMED 2026-05-14:
+    # 27 closed, WR 22% (6W/21L), mean -15%, median -21%. Stand-alone screener
+    # стратегия провалилась — статистически значимо хуже wallet-conviction.
+    # Открытие новых сделок отключено. Monitor оставляем — закрывает оставшиеся 2 open
+    # для чистоты исторической выборки.
     try:
         from . import screener_trader
-        opened, skipped = screener_trader.open_screener_trades(config.database_url)
-        log.info("screener-trader: opened=%d skipped=%d", opened, skipped)
+        # opened, skipped = screener_trader.open_screener_trades(config.database_url)
+        # log.info("screener-trader: opened=%d skipped=%d", opened, skipped)
         n_closed = screener_trader.monitor_screener_trades(config.database_url)
-        log.info("screener-trader monitor: closed=%d", n_closed)
+        log.info("screener-trader monitor: closed=%d (open-new disabled)", n_closed)
     except Exception as e:
-        log.warning("screener_trader pass failed: %s", e)
+        log.warning("screener_trader monitor pass failed: %s", e)
 
     return 0
 

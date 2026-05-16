@@ -354,6 +354,26 @@ def fetch_screener_paper_outcomes(conn):
         return cur.fetchall()
 
 
+def fetch_solo_wallet_outcomes(conn):
+    """Solo-wallet experimental cohort (введён 2026-05-16)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+              solo_wallet_address,
+              status,
+              COUNT(*),
+              ROUND(AVG(pnl_pct)::numeric, 1),
+              ROUND(MIN(pnl_pct)::numeric, 1),
+              ROUND(MAX(pnl_pct)::numeric, 1),
+              ROUND(percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct)::numeric, 1)
+            FROM wallet_paper_trades
+            WHERE from_solo_wallet = TRUE
+            GROUP BY solo_wallet_address, status
+            ORDER BY solo_wallet_address, COUNT(*) DESC
+        """)
+        return cur.fetchall()
+
+
 def fetch_cohort_comparison(conn):
     """Сравнение wallet-conviction (core-trades) vs screener-only (screener-trades)."""
     with conn.cursor() as cur:
@@ -448,6 +468,7 @@ def render(database_url: str, md: bool = False) -> str:
         pool_age_pnl_split = fetch_pool_age_pnl_split(conn)
         screener_paper_rows = fetch_screener_paper_outcomes(conn)
         cohort_comparison_rows = fetch_cohort_comparison(conn)
+        solo_rows = fetch_solo_wallet_outcomes(conn)
 
     # Compute headline numbers
     def _agg(rows, status):
@@ -699,6 +720,20 @@ def render(database_url: str, md: bool = False) -> str:
         parts.append((_md_table if md else _txt_table)(cols, rows))
     else:
         parts.append("  (нет сделок — screener_trader подключится при следующем screener-cron tick)\n")
+
+    # ==== Solo-wallet experiment ====
+    parts.append(f"\n{H2}Solo-wallet experimental cohort (с 2026-05-16){H2_END}")
+    parts.append("  Открываем paper-сделку на КАЖДЫЙ buy конкретных кошельков, без cross-wallet, мгновенно.\n"
+                 "  Цель — проверить переносится ли их легаси WR в новую систему.\n")
+    if solo_rows:
+        rows = []
+        for addr, st, n, mean, worst, best, med in solo_rows:
+            rows.append([addr[:14] + "…", st, n,
+                         _fmt_pct(mean), _fmt_pct(worst), _fmt_pct(best), _fmt_pct(med)])
+        cols = ["wallet", "status", "n", "mean", "worst", "best", "median"]
+        parts.append((_md_table if md else _txt_table)(cols, rows))
+    else:
+        parts.append("  (пока нет solo-сделок — ждём первой покупки от Gvy после деплоя)\n")
 
     parts.append(f"\n{H2}Cohort comparison: wallet-conviction vs screener-only{H2_END}")
     if cohort_comparison_rows:

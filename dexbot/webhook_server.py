@@ -65,6 +65,15 @@ POLL_LOOKBACK_HOURS = 1  # ignore events older than this
 WEBHOOK_DELAY_MIN = int(os.environ.get("WEBHOOK_DELAY_MIN", "5"))
 PENDING_WORKER_INTERVAL_SEC = 30
 
+# Solo-wallet эксперимент (введён 2026-05-16).
+# Открываем paper-сделку на каждый buy от перечисленных кошельков, без
+# cross-wallet conviction. Мгновенно (без delay), follower-exit на их продаже.
+# Цель — проверить переносится ли отдельная высокая WR Gvy в новую систему.
+SOLO_WALLETS: frozenset[str] = frozenset({
+    "GvyLS9WFxUBzoiVPKTJAR2bGLocnoEVWRYh4D8i5z7m1",  # Gvy: legacy 86% WR / +27.7% median
+})
+SOLO_DEDUP_HOURS = 24
+
 app = FastAPI(title="dexbot-webhook")
 
 
@@ -113,17 +122,66 @@ def count_core_buyers(conn, token_address: str, core_set: set[str],
 
 def has_recent_trade(conn, token_address: str,
                      hours: int = DEDUP_RECENT_TRADE_HOURS) -> bool:
+    """Дедуп для core-conviction trades. НЕ считает solo-trades — две стратегии
+    независимы и могут параллельно держать позиции на одном токене."""
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT 1 FROM wallet_paper_trades
             WHERE chain='solana' AND token_address=%s
+              AND from_solo_wallet = FALSE
               AND opened_at >= NOW() - (%s || ' hours')::interval
             LIMIT 1
             """,
             (token_address, str(hours)),
         )
         return cur.fetchone() is not None
+
+
+def has_recent_solo_trade(conn, token_address: str, solo_wallet: str,
+                          hours: int = SOLO_DEDUP_HOURS) -> bool:
+    """Дедуп для solo-стратегии — только своя когорта."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM wallet_paper_trades
+            WHERE chain='solana' AND token_address=%s
+              AND from_solo_wallet = TRUE
+              AND solo_wallet_address = %s
+              AND opened_at >= NOW() - (%s || ' hours')::interval
+            LIMIT 1
+            """,
+            (token_address, solo_wallet, str(hours)),
+        )
+        return cur.fetchone() is not None
+
+
+def open_solo_paper_trade(conn, *, signal_id: int, token_address: str,
+                          symbol: Optional[str], wallet: str,
+                          entry_price: float) -> Optional[int]:
+    """Мгновенное открытие solo-сделки — без задержки и cross-wallet."""
+    if entry_price <= 0:
+        return None
+    stop = entry_price * (1 + SL_PCT / 100.0)
+    take = entry_price * (1 + TP_PCT / 100.0)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO wallet_paper_trades (
+                signal_id, chain, token_address, symbol, triggered_by_wallet,
+                entry_price_usd, stop_price_usd, take_price_usd,
+                from_core_conviction, from_webhook, webhook_delay_min,
+                from_solo_wallet, solo_wallet_address
+            )
+            VALUES (%s, 'solana', %s, %s, %s, %s, %s, %s, FALSE, TRUE, NULL, TRUE, %s)
+            ON CONFLICT (signal_id) DO NOTHING
+            RETURNING id
+            """,
+            (signal_id, token_address, symbol, wallet,
+             entry_price, stop, take, wallet),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 def token_metadata(conn, addr: str) -> tuple[bool | None, str | None]:
@@ -364,6 +422,26 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
         conn.commit()
         return {"sig": sig, "skip": "signal_dup", "wallet": wallet[:8]}
 
+    # === SOLO-WALLET СТРАТЕГИЯ (введена 2026-05-16) ===
+    # Если wallet входит в SOLO_WALLETS — открываем независимую paper-сделку
+    # МГНОВЕННО (без задержки) и БЕЗ cross-wallet требования. Дедуп — только
+    # против других solo-сделок. Параллельно с core-conviction логикой ниже.
+    solo_trade_id: Optional[int] = None
+    if wallet in SOLO_WALLETS:
+        if has_recent_solo_trade(conn, ev.token_mint, wallet):
+            log.info("  solo skip dedup: %s buy %s", wallet[:8], symbol or ev.token_mint[:8])
+        elif price is None:
+            log.info("  solo skip no_price: %s buy %s", wallet[:8], symbol or ev.token_mint[:8])
+        else:
+            solo_trade_id = open_solo_paper_trade(
+                conn, signal_id=sig_id, token_address=ev.token_mint,
+                symbol=symbol, wallet=wallet, entry_price=price,
+            )
+            if solo_trade_id:
+                log.info("  SOLO OPENED: trade=%d wallet=%s token=%s entry=%.6f",
+                         solo_trade_id, wallet[:8], symbol or ev.token_mint[:8], price)
+        conn.commit()
+
     n_buyers = count_core_buyers(conn, ev.token_mint, core_set)
     result: dict[str, Any] = {
         "sig": sig, "wallet": wallet[:8], "token": (symbol or ev.token_mint[:8]),
@@ -390,6 +468,8 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
     conn.commit()
     result["pending_id"] = pending_id
     result["delay_min"] = WEBHOOK_DELAY_MIN
+    if solo_trade_id:
+        result["solo_trade_id"] = solo_trade_id
     return result
 
 

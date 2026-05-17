@@ -83,34 +83,82 @@ CSV_FIELDS = [
     "buy_pool", "sell_pool",
 ]
 
-# ── Список токенов для мониторинга (топ-20 Solana мемов + WSOL контроль) ──────
-# Адреса лучше brand-известны; discovery пропустит токены без ликвидных пулов.
-DEFAULT_TOKENS: list[tuple[str, str]] = [
-    # Текущий watch list (7)
+# ── Список токенов для мониторинга ────────────────────────────────────────────
+# Hardcoded — известные топ-мемы (используется как fallback и подмножество).
+# При запуске по умолчанию ИЗ DexScreener подгружаются дополнительно ~80 токенов
+# с liq > $100k через несколько search-запросов.
+HARDCODED_TOKENS: list[tuple[str, str]] = [
     ("BONK",     "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"),
     ("WIF",      "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"),
     ("POPCAT",   "7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"),
     ("TRUMP",    "6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN"),
     ("FARTCOIN", "9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump"),
     ("MEW",      "MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5"),
-    ("SLERF",    "7BgBvyjrZX1YKz4oh9mjb8ZScatkkwb8DzFx7ByyfFg5"),
-    # Расширение до 20 (+13)
-    ("BOME",     "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82"),
-    ("PNUT",     "2qEHjDLDLbuBgRYvsxhc5D6uDWAivNFZGan56P1tpump"),
-    ("MOODENG",  "ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY"),
-    ("GOAT",     "CzLSujWBLFsSjncfkh59rUFqvafWcY5tzedWJSuypump"),
-    ("MOTHER",   "3S8qX1MsMqRbiwKg2cQyx7nis1oHMgaCuc9c4VfvVdPN"),
     ("GIGA",     "63LfDmNb3MQ8mw9MtZ2To9bEA2M71kZUUGq5tiJxcqj9"),
-    ("MICHI",    "5mbK36SZ7J19An8jFochhQS4of8g6BwUjbeCSxBSoWdp"),
-    ("CHILLGUY", "Df6yfrKC8kZE3KNkrHERKzAetSxbrWeniQfyJY4Jpump"),
-    ("PONKE",    "5z3EqYQo9HiCEs3R84RCDMu2n7anpDMxRhdK8PSWmrRC"),
-    ("ACT",      "GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgUnpump"),
-    ("RETARDIO", "6ogzHhzdrQr9Pgv6hZ2MNze7UrzBMAFyBBWUYp1Fhitx"),
-    ("SPX",      "J3NKxxXZcnNiMjKw9hYb2K4LUxgwB6t1FtPtQVsv3KFr"),
-    ("NEIRO",    "CTg3ZgYx55nnBHaPB9CmKn8nM7uXq7E1uMa6cWxdpump"),
-    # Контрольная группа — должна показать 0 opportunities
-    ("WSOL",     "So11111111111111111111111111111111111111112"),
+    ("BOME",     "ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82"),
+    ("WSOL",     "So11111111111111111111111111111111111111112"),  # контроль
 ]
+
+# Search queries для auto-discovery — покрытие популярных meme-категорий
+DISCOVERY_QUERIES = [
+    "MEME", "CAT", "DOG", "PEPE", "TRUMP", "BONK", "WIF", "MEW",
+    "POPCAT", "GIGA", "PUMP", "MEOW", "SHIB", "ELON", "MOG",
+    "CHEF", "APE", "MOON", "FROG", "INU",
+]
+
+# Минимальная ликвидность для добавления токена в universe
+AUTO_DISCOVERY_MIN_LIQ_USD = 100_000
+AUTO_DISCOVERY_TOP_N = 80
+
+
+def auto_discover_tokens() -> list[tuple[str, str]]:
+    """
+    Опрашивает DexScreener search endpoint с несколькими keyword'ами,
+    агрегирует уникальные Solana токены с ликвидностью > $100k.
+    Возвращает топ-N по ликвидности.
+    """
+    seen: dict[str, dict] = {}
+    excluded_quotes = {USDC_MINT, WSOL_MINT, "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"}  # +USDT
+
+    for q in DISCOVERY_QUERIES:
+        try:
+            r = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={q}", timeout=10)
+            if r.status_code != 200:
+                continue
+            for p in r.json().get("pairs", []) or []:
+                if p.get("chainId") != "solana":
+                    continue
+                base = p.get("baseToken") or {}
+                mint = base.get("address")
+                if not mint or mint in excluded_quotes:
+                    continue
+                liq = (p.get("liquidity") or {}).get("usd", 0)
+                if liq < AUTO_DISCOVERY_MIN_LIQ_USD:
+                    continue
+                if mint not in seen or seen[mint]["liq"] < liq:
+                    seen[mint] = {"symbol": base.get("symbol", "?")[:14], "liq": liq}
+        except Exception as e:
+            log.debug("search '%s' failed: %s", q, e)
+            continue
+        time.sleep(0.2)
+
+    # Топ по ликвидности
+    ranked = sorted(seen.items(), key=lambda x: -x[1]["liq"])[:AUTO_DISCOVERY_TOP_N]
+    discovered = [(d["symbol"], mint) for mint, d in ranked]
+
+    # Объединяем с hardcoded списком (исключая дубликаты)
+    final: list[tuple[str, str]] = []
+    seen_mints: set[str] = set()
+    for sym, m in HARDCODED_TOKENS + discovered:
+        if m in seen_mints:
+            continue
+        seen_mints.add(m)
+        final.append((sym, m))
+    return final
+
+
+# WSOL/USDC reference pool — оракул цены SOL для USD-конверсии cross-quote пулов
+WSOL_USDC_REFERENCE_POOL = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"  # Orca Whirlpool
 
 
 # ── Base58 (vendored, без зависимостей) ───────────────────────────────────────
@@ -380,8 +428,8 @@ def decode_raydium_price(base_data: bytes | None, quote_data: bytes | None,
 
 # ── Tick loop ─────────────────────────────────────────────────────────────────
 
-def _build_address_list(pools: list[Pool]) -> tuple[list[str], list[tuple[str, int]]]:
-    """Возвращает (адреса для batch RPC, индексы для парсинга обратно)."""
+def _build_address_list(pools: list[Pool]) -> tuple[list[str], list[tuple[str, int]], int]:
+    """Возвращает (адреса для batch RPC, индексы пулов, индекс reference SOL/USDC)."""
     addrs: list[str] = []
     layout: list[tuple[str, int]] = []
     for pool in pools:
@@ -392,12 +440,16 @@ def _build_address_list(pools: list[Pool]) -> tuple[list[str], list[tuple[str, i
             layout.append(("raydium", len(addrs)))
             addrs.append(pool.base_vault)
             addrs.append(pool.quote_vault)
-    return addrs, layout
+    # SOL/USDC reference в конце для оракула
+    sol_oracle_idx = len(addrs)
+    addrs.append(WSOL_USDC_REFERENCE_POOL)
+    return addrs, layout, sol_oracle_idx
 
 
-def tick_prices(rpc: str, pools: list[Pool],
-                addrs: list[str], layout: list[tuple[str, int]]) -> dict[int, float]:
-    """Возвращает {pool_idx: price_in_quote}."""
+def tick_prices(rpc: str, pools: list[Pool], addrs: list[str],
+                layout: list[tuple[str, int]],
+                sol_oracle_idx: int) -> tuple[dict[int, float], float | None]:
+    """Возвращает ({pool_idx: price_in_quote}, sol_usd)."""
     accounts = get_multiple_accounts(rpc, addrs)
     prices: dict[int, float] = {}
     for i, (pool, (kind, start)) in enumerate(zip(pools, layout)):
@@ -409,24 +461,53 @@ def tick_prices(rpc: str, pools: list[Pool],
             price = None
         if price is not None and price > 0:
             prices[i] = price
-    return prices
+
+    # SOL/USDC оракул
+    sol_usd = None
+    if sol_oracle_idx < len(accounts) and accounts[sol_oracle_idx] is not None:
+        data = accounts[sol_oracle_idx]
+        if len(data) == WP_DATA_LEN:
+            sqrt_price = int.from_bytes(data[WP_SQRT_PRICE:WP_SQRT_PRICE + 16], "little")
+            if sqrt_price > 0:
+                raw = (sqrt_price / (2**64)) ** 2
+                sol_usd = raw * 1000
+
+    return prices, sol_usd
 
 
-def detect_arbs(pools: list[Pool], prices: dict[int, float]) -> list[dict]:
-    """Группирует пулы по (symbol, quote_mint), ищет cross-DEX спреды."""
-    by_group: dict[tuple[str, str], list[tuple[int, Pool, float]]] = {}
+def detect_arbs(pools: list[Pool], prices: dict[int, float],
+                sol_usd: float | None = None) -> list[dict]:
+    """
+    Группирует пулы по symbol и сравнивает их цены в USD.
+    SOL-quoted пулы конвертируются через sol_usd оракул, чтобы можно было
+    сравнивать с USDC-quoted пулами на других DEX'ах.
+    """
+    by_mint: dict[str, list[tuple[Pool, float]]] = {}
     for i, pool in enumerate(pools):
-        if i in prices:
-            by_group.setdefault((pool.symbol, pool.quote_mint), []).append((i, pool, prices[i]))
+        if i not in prices:
+            continue
+        price_in_quote = prices[i]
+        # Нормализуем в USD
+        if pool.quote_mint == USDC_MINT:
+            price_usd = price_in_quote
+        elif pool.quote_mint == WSOL_MINT:
+            if sol_usd is None:
+                continue
+            price_usd = price_in_quote * sol_usd
+        else:
+            continue
+        # КРИТИЧНО: группируем по mint (не symbol) — разные минты с одинаковым
+        # символом это разные токены (часто скам-имитаторы)
+        by_mint.setdefault(pool.target_mint, []).append((pool, price_usd))
 
     opps = []
     ts = datetime.now(timezone.utc).isoformat()
-    for (symbol, quote_mint), group in by_group.items():
+    for target_mint, group in by_mint.items():
         if len(group) < 2:
             continue
-        quote_label = "USDC" if quote_mint == USDC_MINT else "SOL"
-        for _, buy_pool, buy_price in group:
-            for _, sell_pool, sell_price in group:
+        symbol = group[0][0].symbol
+        for buy_pool, buy_price in group:
+            for sell_pool, sell_price in group:
                 if buy_pool.dex == sell_pool.dex:
                     continue
                 if sell_price <= buy_price:
@@ -441,7 +522,7 @@ def detect_arbs(pools: list[Pool], prices: dict[int, float]) -> list[dict]:
                 opps.append({
                     "ts": ts,
                     "symbol": symbol,
-                    "quote": quote_label,
+                    "quote": f"{_quote_label(buy_pool.quote_mint)}→{_quote_label(sell_pool.quote_mint)}",
                     "buy_dex": buy_pool.dex,
                     "sell_dex": sell_pool.dex,
                     "buy_price": round(buy_price, 10),
@@ -456,6 +537,23 @@ def detect_arbs(pools: list[Pool], prices: dict[int, float]) -> list[dict]:
     return opps
 
 
+def _quote_label(mint: str) -> str:
+    return "USDC" if mint == USDC_MINT else ("SOL" if mint == WSOL_MINT else mint[:4])
+
+
+def fetch_sol_usd(rpc: str) -> float | None:
+    """Текущая цена SOL в USDC через Orca Whirlpool reference pool."""
+    data = get_account_info(rpc, WSOL_USDC_REFERENCE_POOL)
+    if data is None or len(data) != WP_DATA_LEN:
+        return None
+    sqrt_price = int.from_bytes(data[WP_SQRT_PRICE:WP_SQRT_PRICE + 16], "little")
+    if sqrt_price == 0:
+        return None
+    raw = (sqrt_price / (2**64)) ** 2
+    # token_a = SOL (9 dec), token_b = USDC (6 dec) — проверено эмпирически
+    return raw * 1000
+
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 def run(duration: int, tokens: list[tuple[str, str]], interval: float) -> None:
@@ -467,21 +565,30 @@ def run(duration: int, tokens: list[tuple[str, str]], interval: float) -> None:
         log.error("Нет пулов — нечего мониторить.")
         return
 
-    # Группировка для отчёта о coverage
-    by_symbol: dict[str, list[str]] = {}
+    # Группировка по mint (разные минты с тем же symbol — разные токены)
+    by_mint: dict[str, list[Pool]] = {}
     for p in pools:
-        by_symbol.setdefault(p.symbol, []).append(p.dex)
+        by_mint.setdefault(p.target_mint, []).append(p)
 
-    log.info("=== Coverage ===")
+    log.info("=== Coverage (по mint) ===")
     cross_dex = []
-    for sym, _ in tokens:
-        dexes = by_symbol.get(sym, [])
-        status = "✓ cross-DEX" if len(set(dexes)) >= 2 else ("~ single DEX" if dexes else "✗ no pools")
-        log.info("  %-10s %d пулов  %s  [%s]", sym, len(dexes), status, ",".join(dexes) or "—")
-        if len(set(dexes)) >= 2:
-            cross_dex.append(sym)
+    for mint, ps in sorted(by_mint.items(), key=lambda x: -len(x[1])):
+        dexes = [p.dex for p in ps]
+        quotes = [_quote_label(p.quote_mint) for p in ps]
+        unique_dexes = set(dexes)
+        if len(unique_dexes) >= 2 or (len(set(quotes)) >= 2 and len(ps) >= 2):
+            status = "✓ cross-DEX"
+            cross_dex.append((ps[0].symbol, mint))
+        elif len(ps) >= 2:
+            status = "~ multi-pool same-DEX"
+        else:
+            status = "~ single pool"
+        log.info("  %-12s %s  %d пулов %s  [%s]",
+                 ps[0].symbol, mint[:8], len(ps), status,
+                 ",".join(f"{d}/{q}" for d, q in zip(dexes, quotes)))
 
-    log.info("Cross-DEX comparable: %d / %d токенов", len(cross_dex), len(tokens))
+    log.info("Cross-DEX comparable: %d / %d уникальных токенов",
+             len(cross_dex), len(by_mint))
     if not cross_dex:
         log.warning("Ни один токен не имеет пулов на >=2 DEX'ах — арбитраж невозможен.")
         return
@@ -490,7 +597,7 @@ def run(duration: int, tokens: list[tuple[str, str]], interval: float) -> None:
         with OUTPUT_CSV.open("w", newline="") as f:
             csv.DictWriter(f, fieldnames=CSV_FIELDS).writeheader()
 
-    addrs, layout = _build_address_list(pools)
+    addrs, layout, sol_oracle_idx = _build_address_list(pools)
     log.info("=== Старт замера: %ds, interval=%.2fs, batched %d accounts/tick ===",
              duration, interval, len(addrs))
     log.info("CSV → %s", OUTPUT_CSV.resolve())
@@ -499,12 +606,15 @@ def run(duration: int, tokens: list[tuple[str, str]], interval: float) -> None:
     tick_count = 0
     total_opps = 0
     max_net_by_symbol: dict[str, float] = {}
+    last_sol_usd: float | None = None
 
     try:
         while time.time() - start < duration:
             tick_start = time.time()
-            prices = tick_prices(rpc, pools, addrs, layout)
-            opps = detect_arbs(pools, prices)
+            prices, sol_usd = tick_prices(rpc, pools, addrs, layout, sol_oracle_idx)
+            if sol_usd is not None:
+                last_sol_usd = sol_usd
+            opps = detect_arbs(pools, prices, last_sol_usd)
 
             if opps:
                 with OUTPUT_CSV.open("a", newline="") as f:
@@ -546,12 +656,14 @@ def print_summary(pools, ticks, total_opps, max_net, elapsed, cross_dex_tokens) 
     if max_net:
         print(f"\nМаксимальный NET спред по токенам:")
         for sym, net in sorted(max_net.items(), key=lambda x: -x[1]):
-            n_per_min = sum(1 for v in [net] if v) / max(elapsed / 60, 1)
-            print(f"  {sym:10s} max NET = {net:+.3f}%")
+            print(f"  {sym:14s} max NET = {net:+.3f}%")
     else:
         print(f"\n✗ Ни одной арбитражной возможности не зафиксировано за {elapsed:.0f}s.")
-        print(f"  Для cross-DEX токенов ({', '.join(cross_dex_tokens)}) edge'а нет")
-        print(f"  на разрешении {int(elapsed/max(ticks,1)*1000)}ms.")
+        names = ", ".join(s for s, _ in cross_dex_tokens[:10])
+        if len(cross_dex_tokens) > 10:
+            names += f", +{len(cross_dex_tokens)-10} ещё"
+        print(f"  Cross-DEX токены ({len(cross_dex_tokens)}): {names}")
+        print(f"  Разрешение: {int(elapsed/max(ticks,1)*1000)}ms")
 
 
 # ── Entry ─────────────────────────────────────────────────────────────────────
@@ -560,8 +672,9 @@ if __name__ == "__main__":
     load_dotenv()
     parser = argparse.ArgumentParser(description="Realtime cross-DEX арбитраж scanner")
     parser.add_argument("--duration", type=int, default=300, help="Длительность, сек")
-    parser.add_argument("--interval", type=float, default=1.0, help="Тик-интервал, сек")
-    parser.add_argument("--tokens", help="comma-separated mints (override default list)")
+    parser.add_argument("--interval", type=float, default=0.25, help="Тик-интервал, сек (default 0.25 = 4 Hz)")
+    parser.add_argument("--tokens", help="comma-separated mints (override auto-discovery)")
+    parser.add_argument("--no-auto", action="store_true", help="Не делать auto-discovery (только hardcoded list)")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -573,7 +686,13 @@ if __name__ == "__main__":
 
     if args.tokens:
         tokens = [(m.strip()[:8].upper(), m.strip()) for m in args.tokens.split(",") if m.strip()]
+        log.info("Tokens: явный список из --tokens (%d шт)", len(tokens))
+    elif args.no_auto:
+        tokens = HARDCODED_TOKENS
+        log.info("Tokens: hardcoded list (%d шт)", len(tokens))
     else:
-        tokens = DEFAULT_TOKENS
+        log.info("Tokens: auto-discovery через DexScreener ...")
+        tokens = auto_discover_tokens()
+        log.info("Tokens: discovered %d токенов с liq > $%d", len(tokens), AUTO_DISCOVERY_MIN_LIQ_USD)
 
     run(args.duration, tokens, args.interval)

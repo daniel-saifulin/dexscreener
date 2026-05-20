@@ -12,7 +12,9 @@ concurrency:
 jobs:
   poll:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 25 мин — было 15, но при backlog после downtime (несколько часов накопленных
+    # txn'ов на 100+ кошельков с Helius пагинацией) не успевало уложиться.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

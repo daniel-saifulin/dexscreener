@@ -70,7 +70,8 @@ PENDING_WORKER_INTERVAL_SEC = 30
 # cross-wallet conviction. Мгновенно (без delay), follower-exit на их продаже.
 # Цель — проверить переносится ли отдельная высокая WR Gvy в новую систему.
 SOLO_WALLETS: frozenset[str] = frozenset({
-    "GvyLS9WFxUBzoiVPKTJAR2bGLocnoEVWRYh4D8i5z7m1",  # Gvy: legacy 86% WR / +27.7% median
+    "GvyLS9WFxUBzoiVPKTJAR2bGLocnoEVWRYh4D8i5z7m1",  # Gvy: 84% WR / +18% median на 193 closed (новая era)
+    "BSfQT2AmdxQfpsGQANrcYEUcwta5PWuTfBkHxqsZ3Gz8",  # BSf: 61% WR / +1.7% median на 124 closed — добавлен 2026-05-22
 })
 SOLO_DEDUP_HOURS = 24
 

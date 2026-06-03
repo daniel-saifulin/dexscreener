@@ -283,31 +283,31 @@ def enqueue_pending_trade(conn, *, signal_id: int, token_address: str,
 # DexScreener price (synchronous; ~200-500ms typical)
 # ---------------------------------------------------------------------------
 
-def fetch_sol_price(token_address: str) -> tuple[float | None, str | None]:
-    """Returns (priceUsd, symbol) for a Solana token. None on failure."""
+def fetch_sol_price(token_address: str) -> tuple[float | None, str | None, dict | None]:
+    """Returns (priceUsd, symbol, pair_dict) for a Solana token. None values on failure."""
     try:
         r = requests.get(
             f"https://api.dexscreener.com/latest/dex/tokens/{token_address}",
             timeout=5,
         )
         if not r.ok:
-            return None, None
+            return None, None, None
         data = r.json()
         pairs = (data.get("pairs") if isinstance(data, dict) else None) or []
         pairs = [p for p in pairs if (p.get("chainId") or "").lower() == "solana"]
         if not pairs:
-            return None, None
+            return None, None, None
         # Best = highest liquidity
         valid = [p for p in pairs if (p.get("liquidity") or {}).get("usd")]
         if not valid:
-            return None, None
+            return None, None, None
         pair = max(valid, key=lambda p: float(p["liquidity"]["usd"]))
         price_str = pair.get("priceUsd")
         symbol = (pair.get("baseToken") or {}).get("symbol")
-        return (float(price_str) if price_str else None), symbol
+        return (float(price_str) if price_str else None), symbol, pair
     except Exception as e:
         log.warning("dexscreener failed for %s: %s", token_address[:8], e)
-        return None, None
+        return None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ def process_sell_event(conn, ev, wallet: str) -> dict[str, Any]:
     if not trades:
         return {"sig": sig, "skip": "sell_no_open_trade", "wallet": wallet[:8]}
 
-    price, _ = fetch_sol_price(ev.token_mint)
+    price, _, _pair = fetch_sol_price(ev.token_mint)
     if price is None:
         return {"sig": sig, "skip": "sell_no_price", "wallet": wallet[:8]}
 
@@ -436,7 +436,7 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
     ever_passed, cand_symbol = token_metadata(conn, ev.token_mint)
     in_cand = ever_passed is not None
 
-    price, pair_symbol = fetch_sol_price(ev.token_mint)
+    price, pair_symbol, pair = fetch_sol_price(ev.token_mint)
     symbol = cand_symbol or pair_symbol
 
     # Observational: захватываем pool_address из tx + pool_age_at_signal_min.
@@ -571,7 +571,7 @@ def decide_pending(conn, pending_id: int, signal_id: int, token_address: str,
             return "dropped_no_conviction", None, None
         if has_recent_trade(conn, token_address):
             return "dropped_dedup", None, None
-        price, symbol = fetch_sol_price(token_address)
+        price, symbol, _pair = fetch_sol_price(token_address)
         if price is None:
             return "dropped_no_price", None, None
         trade_id = open_paper_trade(
@@ -666,7 +666,7 @@ def process_live_monitor_batch() -> dict[str, int]:
         for t in trades:
             counts["checked"] += 1
             try:
-                price, _ = fetch_sol_price(t[1])
+                price, _, _pair = fetch_sol_price(t[1])
                 if price is None:
                     continue
                 stop = float(t[6])

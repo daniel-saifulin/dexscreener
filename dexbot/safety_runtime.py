@@ -22,8 +22,12 @@ RUGCHECK_TIMEOUT = 10
 # Допустимый уровень риска по RugCheck. Что-то жёстче — отказ.
 ALLOWED_RISK_LEVELS = {"info", "warn"}   # "danger" блокируется
 
-# Минимальная ликвидность пула для входа в live
-MIN_LIQUIDITY_USD_LIVE = 30_000.0
+# Минимальная ликвидность пула для входа в live.
+# Снижено с $30k → $1k чтобы матчить paper-стратегию (paper фильтра не имел).
+# При $5 позиции $1k пула = ~0.5% slippage, slippage-cap (300bps) защитит выше.
+# Можно переопределить через env LIVE_MIN_LIQUIDITY (как в risk_guard).
+import os as _os
+MIN_LIQUIDITY_USD_LIVE = float(_os.environ.get("LIVE_MIN_LIQUIDITY", "1000.0"))
 
 
 @dataclass

@@ -45,8 +45,11 @@ MAX_TRADES_PER_DAY: int = int(os.environ.get("LIVE_MAX_TRADES_DAY", "20"))
 # Slippage cap при квоте Jupiter — отказываем входить если price impact больше
 MAX_SLIPPAGE_BPS: int = int(os.environ.get("LIVE_MAX_SLIPPAGE_BPS", "300"))  # 3%
 
-# Минимальная ликвидность пула для входа (отказ если меньше)
-MIN_POOL_LIQUIDITY_USD: float = float(os.environ.get("LIVE_MIN_LIQUIDITY", "30000.0"))
+# Минимальная ликвидность пула для входа (отказ если меньше).
+# При $5 позиции и $1000 пуле теоретический slippage = 0.5% — а отдельный
+# slippage-cap (300bps) ловит реально проблемные случаи. Paper-стратегия
+# работала без фильтра по ликвидности, поэтому держим минимальный floor.
+MIN_POOL_LIQUIDITY_USD: float = float(os.environ.get("LIVE_MIN_LIQUIDITY", "1000.0"))
 
 # Главный kill-switch. Если FALSE — никакие сделки не открываются вообще.
 LIVE_TRADING_ENABLED: bool = os.environ.get("LIVE_TRADING_ENABLED", "false").lower() == "true"

@@ -482,19 +482,25 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
         # Дополнительно к paper-сделке пытаемся открыть РЕАЛЬНУЮ сделку.
         # Цепочка: risk_guard → safety_runtime → Jupiter swap.
         # Не блокирует webhook — все защиты внутри live_executor.try_open_live.
-        if wallet in live_executor.SOLO_LIVE_WALLETS and pair is not None:
-            try:
-                live_res = live_executor.try_open_live(
-                    conn, signal_id=sig_id, source_wallet=wallet,
-                    token_mint=ev.token_mint, symbol=symbol, pair=pair,
-                )
-                if live_res.success:
-                    log.info("  >>> LIVE TRADE OPENED: id=%d tx=%s",
-                             live_res.trade_id, (live_res.tx_sig or "?")[:12])
-                else:
-                    log.info("  live trade not opened: %s", live_res.reason)
-            except Exception as e:
-                log.exception("  live trade attempt crashed: %s", e)
+        if wallet in live_executor.SOLO_LIVE_WALLETS:
+            if pair is None:
+                log.info("  live skip: no_pair (DexScreener returned None) wallet=%s token=%s",
+                         wallet[:8], symbol or ev.token_mint[:8])
+            else:
+                try:
+                    live_res = live_executor.try_open_live(
+                        conn, signal_id=sig_id, source_wallet=wallet,
+                        token_mint=ev.token_mint, symbol=symbol, pair=pair,
+                    )
+                    if live_res.success:
+                        log.info("  >>> LIVE TRADE OPENED: id=%d tx=%s",
+                                 live_res.trade_id, (live_res.tx_sig or "?")[:12])
+                    else:
+                        log.info("  live trade not opened: %s (wallet=%s token=%s)",
+                                 live_res.reason, wallet[:8],
+                                 symbol or ev.token_mint[:8])
+                except Exception as e:
+                    log.exception("  live trade attempt crashed: %s", e)
 
     n_buyers = count_core_buyers(conn, ev.token_mint, core_set)
     result: dict[str, Any] = {

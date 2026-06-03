@@ -122,7 +122,8 @@ def test_low_pool_liquidity_blocked(monkeypatch):
     _enable_live(monkeypatch)
     snap = CapitalSnapshot(50.0, 50.0, 0, datetime.date.today(), False, None)
     conn = _conn_with_state(snap)
-    r = check_can_open(conn, proposed_position_usd=5.0, pool_liquidity_usd=5_000.0)
+    # Порог MIN_POOL_LIQUIDITY_USD по умолчанию $1000. $500 < $1k → блок.
+    r = check_can_open(conn, proposed_position_usd=5.0, pool_liquidity_usd=500.0)
     assert not r.allowed
     assert "liquidity" in r.reason
 

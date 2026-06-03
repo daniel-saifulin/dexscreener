@@ -37,6 +37,7 @@ load_dotenv()
 
 from .parser import parse_swap  # noqa: E402
 from . import onchain  # noqa: E402
+from . import live_executor  # noqa: E402
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
@@ -373,6 +374,40 @@ def process_sell_event(conn, ev, wallet: str) -> dict[str, Any]:
                 log.info("  FOLLOWER EXIT: trade=%d wallet=%s token=%s pnl=%+.1f%%",
                          trade_id, wallet[:8], symbol or ev.token_mint[:8], pnl_pct)
     conn.commit()
+
+    # === LIVE FOLLOWER-EXIT: закрываем РЕАЛЬНУЮ позицию если Gvy продал ===
+    if wallet in live_executor.SOLO_LIVE_WALLETS:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, token_address, entry_amount_usd, entry_amount_tokens,
+                       sol_price_usd_at_entry, source_wallet
+                FROM live_trades
+                WHERE status = 'open'
+                  AND source_wallet = %s
+                  AND token_address = %s
+                """,
+                (wallet, ev.token_mint),
+            )
+            live_trades = cur.fetchall()
+        for lt in live_trades:
+            trade_dict = {
+                "id": lt[0], "token_address": lt[1],
+                "entry_amount_usd": lt[2], "entry_amount_tokens": lt[3],
+                "sol_price_usd_at_entry": lt[4], "source_wallet": lt[5],
+            }
+            try:
+                close_res = live_executor.try_close_live(
+                    conn, trade_dict, exit_reason="wallet_sold"
+                )
+                if close_res.success:
+                    log.info("  >>> LIVE FOLLOWER EXIT: trade=%d pnl=%+.2f%%",
+                             lt[0], close_res.pnl_pct or 0)
+                else:
+                    log.warning("  live follower close failed: %s", close_res.reason)
+            except Exception as e:
+                log.exception("  live follower exit crashed: %s", e)
+
     return {"sig": sig, "closed_trades": closed, "wallet": wallet[:8], "exit_price": price}
 
 
@@ -442,6 +477,24 @@ def process_one_tx(conn, tx: dict, core_set: set[str]) -> dict[str, Any]:
                 log.info("  SOLO OPENED: trade=%d wallet=%s token=%s entry=%.6f",
                          solo_trade_id, wallet[:8], symbol or ev.token_mint[:8], price)
         conn.commit()
+
+        # === LIVE TRADING (если включено LIVE_TRADING_ENABLED=true) ===
+        # Дополнительно к paper-сделке пытаемся открыть РЕАЛЬНУЮ сделку.
+        # Цепочка: risk_guard → safety_runtime → Jupiter swap.
+        # Не блокирует webhook — все защиты внутри live_executor.try_open_live.
+        if wallet in live_executor.SOLO_LIVE_WALLETS and pair is not None:
+            try:
+                live_res = live_executor.try_open_live(
+                    conn, signal_id=sig_id, source_wallet=wallet,
+                    token_mint=ev.token_mint, symbol=symbol, pair=pair,
+                )
+                if live_res.success:
+                    log.info("  >>> LIVE TRADE OPENED: id=%d tx=%s",
+                             live_res.trade_id, (live_res.tx_sig or "?")[:12])
+                else:
+                    log.info("  live trade not opened: %s", live_res.reason)
+            except Exception as e:
+                log.exception("  live trade attempt crashed: %s", e)
 
     n_buyers = count_core_buyers(conn, ev.token_mint, core_set)
     result: dict[str, Any] = {
@@ -587,6 +640,90 @@ async def pending_worker() -> None:
         await asyncio.sleep(PENDING_WORKER_INTERVAL_SEC)
 
 
+LIVE_MONITOR_INTERVAL_SEC = 60
+
+
+def process_live_monitor_batch() -> dict[str, int]:
+    """Мониторинг open live_trades — проверка TP/SL/max_hold через DexScreener."""
+    import time as _time
+    counts: dict[str, int] = {"checked": 0, "closed_tp": 0, "closed_sl": 0,
+                              "closed_max_hold": 0, "errors": 0}
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, token_address, symbol, entry_price_usd,
+                       entry_amount_usd, entry_amount_tokens,
+                       stop_price_usd, take_price_usd, opened_at,
+                       sol_price_usd_at_entry, source_wallet
+                FROM live_trades
+                WHERE status = 'open'
+                ORDER BY opened_at
+                """
+            )
+            trades = cur.fetchall()
+
+        for t in trades:
+            counts["checked"] += 1
+            try:
+                price, _ = fetch_sol_price(t[1])
+                if price is None:
+                    continue
+                stop = float(t[6])
+                take = float(t[7])
+                opened_at = t[8]
+                age_hours = (_time.time() - opened_at.timestamp()) / 3600
+
+                exit_reason = None
+                if price <= stop:
+                    exit_reason = "stop"
+                elif price >= take:
+                    exit_reason = "take_profit"
+                elif age_hours > 168:
+                    exit_reason = "max_hold"
+
+                if exit_reason is None:
+                    continue
+
+                trade_dict = {
+                    "id": t[0], "token_address": t[1],
+                    "entry_amount_usd": t[4], "entry_amount_tokens": t[5],
+                    "sol_price_usd_at_entry": t[9], "source_wallet": t[10],
+                }
+                res = live_executor.try_close_live(conn, trade_dict,
+                                                   exit_reason=exit_reason)
+                if res.success:
+                    if exit_reason == "stop":
+                        counts["closed_sl"] += 1
+                    elif exit_reason == "take_profit":
+                        counts["closed_tp"] += 1
+                    else:
+                        counts["closed_max_hold"] += 1
+                    log.info("LIVE MONITOR closed #%d: %s pnl=%+.2f%%",
+                             t[0], exit_reason, res.pnl_pct or 0)
+                else:
+                    counts["errors"] += 1
+                    log.warning("LIVE MONITOR close failed for #%d: %s", t[0], res.reason)
+            except Exception:
+                counts["errors"] += 1
+                log.exception("LIVE MONITOR error on trade #%d", t[0])
+    return counts
+
+
+async def live_monitor_worker() -> None:
+    """Воркер для отслеживания open live_trades. Запускается при стартапе."""
+    log.info("live_monitor_worker started (interval=%ds, max_hold=168h)",
+             LIVE_MONITOR_INTERVAL_SEC)
+    while True:
+        try:
+            counts = await asyncio.to_thread(process_live_monitor_batch)
+            if counts.get("checked", 0) > 0 and any(v > 0 for k, v in counts.items() if k != "checked"):
+                log.info("  live monitor: %s", counts)
+        except Exception:
+            log.exception("live_monitor iteration failed")
+        await asyncio.sleep(LIVE_MONITOR_INTERVAL_SEC)
+
+
 # ---------------------------------------------------------------------------
 # HTTP routes
 # ---------------------------------------------------------------------------
@@ -594,6 +731,7 @@ async def pending_worker() -> None:
 @app.on_event("startup")
 async def _on_startup() -> None:
     asyncio.create_task(pending_worker())
+    asyncio.create_task(live_monitor_worker())
 
 @app.get("/health")
 def health():
@@ -624,6 +762,34 @@ def core():
         with _conn() as conn:
             core_set = fetch_core_set(conn)
         return {"count": len(core_set), "addresses": sorted(core_set)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/live-status")
+def live_status():
+    """Текущее состояние live trading: capital, open trades, halt-флаг."""
+    try:
+        from . import risk_guard
+        with _conn() as conn:
+            snap = risk_guard.fetch_capital_state(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*), COUNT(*) FILTER (WHERE status='open') FROM live_trades"
+                )
+                total, open_n = cur.fetchone()
+        return {
+            "live_trading_enabled": risk_guard.LIVE_TRADING_ENABLED,
+            "is_halted": snap.is_halted,
+            "halt_reason": snap.halt_reason,
+            "wallet_balance_usd": snap.wallet_balance_usd,
+            "peak_balance_usd": snap.peak_balance_usd,
+            "daily_pnl_usd": snap.daily_pnl_usd,
+            "daily_anchor_date": str(snap.daily_anchor_date) if snap.daily_anchor_date else None,
+            "trades_total": total,
+            "trades_open": open_n,
+            "solo_live_wallets": sorted(live_executor.SOLO_LIVE_WALLETS),
+        }
     except Exception as e:
         return {"error": str(e)}
 

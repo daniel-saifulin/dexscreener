@@ -40,6 +40,14 @@ SLIPPAGE_BPS = int(os.environ.get("LIVE_MAX_SLIPPAGE_BPS", "300"))
 # Max hold limit (как в paper)
 MAX_HOLD_HOURS = 168
 
+# Lifetime per-token dedup. Если True — НИКОГДА не входим повторно в токен,
+# который уже был хоть раз в live_trades (любой status). Защита от ре-входа
+# на тех же mintsах, где Gvy крутит 5-10 buy в день.
+# Источник логики: запрос пользователя 2026-06-04 — "новый можно, старый нет".
+LIVE_LIFETIME_TOKEN_DEDUP: bool = (
+    os.environ.get("LIVE_LIFETIME_TOKEN_DEDUP", "true").lower() == "true"
+)
+
 
 # ---------------------------------------------------------------------------
 # Утилиты
@@ -136,6 +144,18 @@ class OpenResult:
     snapshot: dict = None
 
 
+def _has_any_live_trade_on_token(conn, token_mint: str) -> bool:
+    """Lifetime per-token dedup. True если в live_trades УЖЕ есть запись на этот
+    mint (любой status — open/closed_tp/closed_sl/closed_wallet_sold/etc).
+    Защита от повторных входов на токены где Gvy делает 5-10 buy подряд."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM live_trades WHERE token_address=%s LIMIT 1",
+            (token_mint,),
+        )
+        return cur.fetchone() is not None
+
+
 def try_open_live(
     conn,
     *,
@@ -147,7 +167,7 @@ def try_open_live(
 ) -> OpenResult:
     """Главная функция входа в live trade. Возвращает OpenResult.
 
-    Цепочка проверок: risk_guard → safety_runtime → quote → execute.
+    Цепочка проверок: lifetime-dedup → risk_guard → safety_runtime → quote → execute.
     Любой fail → return early без побочных эффектов.
     """
     snap = {"source_wallet": source_wallet[:8], "token": token_mint[:8]}
@@ -155,6 +175,11 @@ def try_open_live(
     # 0. Whitelist check
     if source_wallet not in SOLO_LIVE_WALLETS:
         return OpenResult(False, f"wallet_not_in_live_set", snapshot=snap)
+
+    # 0a. Lifetime per-token dedup — НИКОГДА не входим в один и тот же mint дважды.
+    # Даже если первая позиция закрылась с прибылью, второй вход не открываем.
+    if LIVE_LIFETIME_TOKEN_DEDUP and _has_any_live_trade_on_token(conn, token_mint):
+        return OpenResult(False, "token_already_live_traded", snapshot=snap)
 
     # 1. SOL price
     sol_price = _get_sol_price_usd()

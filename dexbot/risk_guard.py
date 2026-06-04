@@ -30,8 +30,10 @@ log = logging.getLogger("dexbot.risk_guard")
 # Максимальный размер ОДНОЙ позиции в USD
 MAX_POSITION_USD: float = float(os.environ.get("LIVE_MAX_POSITION_USD", "5.0"))
 
-# Сколько одновременных позиций (на старте — 1)
-MAX_CONCURRENT_POSITIONS: int = int(os.environ.get("LIVE_MAX_CONCURRENT", "1"))
+# Сколько одновременных позиций. Бамп с 1 → 7 по запросу пользователя
+# 2026-06-04: throughput с 1 был критически ограничен (5+ часов на сделку).
+# Math: 7 × $5 = $35 из $54.79 капитала → буфер ~$20 на gas/SOL price-volatility.
+MAX_CONCURRENT_POSITIONS: int = int(os.environ.get("LIVE_MAX_CONCURRENT", "7"))
 
 # Лимит потерь за день (по дням UTC). При -$10 → halt до утра.
 DAILY_LOSS_LIMIT_USD: float = float(os.environ.get("LIVE_DAILY_LOSS_USD", "10.0"))

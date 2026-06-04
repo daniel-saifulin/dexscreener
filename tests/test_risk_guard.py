@@ -103,7 +103,8 @@ def test_drawdown_triggers_halt(monkeypatch):
 def test_too_many_concurrent_positions(monkeypatch):
     _enable_live(monkeypatch)
     snap = CapitalSnapshot(50.0, 50.0, 0, datetime.date.today(), False, None)
-    conn = _conn_with_state(snap, open_positions=1)  # уже 1 открыта, лимит 1
+    # Лимит MAX_CONCURRENT_POSITIONS=7 → 7 открытых блокируют новую.
+    conn = _conn_with_state(snap, open_positions=7)
     r = check_can_open(conn, proposed_position_usd=5.0)
     assert not r.allowed
     assert "positions open" in r.reason

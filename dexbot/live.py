@@ -4,9 +4,13 @@
 делается выше по стеку: risk_guard + safety_runtime.
 
 Зависит от:
-- Jupiter Quote API: https://quote-api.jup.ag/v6/quote
-- Jupiter Swap API: https://quote-api.jup.ag/v6/swap
+- Jupiter Quote API: https://lite-api.jup.ag/swap/v1/quote (free tier, no key)
+- Jupiter Swap API: https://lite-api.jup.ag/swap/v1/swap
 - Solana RPC: используем Helius (мы платим за Developer tier)
+
+ВАЖНО: старый endpoint quote-api.jup.ag deprecated и больше не резолвится
+DNS на fly.io. Это была причина 100% провала live-сделок 03-04 июня 2026.
+Можно переопределить через env JUPITER_API_BASE (например platform key).
 
 Приватный ключ кошелька:
 - ЛОКАЛЬНО: в .env как `SOLANA_PRIVATE_KEY` (base58)
@@ -39,8 +43,9 @@ USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 LAMPORTS_PER_SOL = 1_000_000_000
 DEFAULT_SLIPPAGE_BPS = 300  # 3%
 
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+_JUP_BASE = os.environ.get("JUPITER_API_BASE", "https://lite-api.jup.ag").rstrip("/")
+JUPITER_QUOTE_URL = f"{_JUP_BASE}/swap/v1/quote"
+JUPITER_SWAP_URL = f"{_JUP_BASE}/swap/v1/swap"
 
 
 def _helius_rpc_url() -> str:
